@@ -1,9 +1,5 @@
-DualSense for RDR2  v1.3.0-fork.1  -  Community Fork (based on OldKrab's v1.3.0)
-==============================================================================
-
-Unofficial community fork by TochaRude, adapted with the help of Antigravity
-(not an official collaboration with OldKrab; full credit for the original mod belongs to OldKrab).
-Testers and feedback are welcome: https://github.com/TochaRude/rdr2-dualsense/issues
+DualSense for RDR2  v1.3.0  -  by OldKrab
+==========================================
 
 Full DualSense support for Red Dead Redemption 2 on PC: adaptive triggers made per weapon,
 voice-coil haptics, dialogue you can feel (experimental), lightbar, speaker and microphone - driven by what
@@ -141,8 +137,7 @@ Source code (MIT): see the mod page.
 
 CHANGES
 -------
-1.3.0-fork.1  Community fork release based on OldKrab's v1.3.0 (adapted with Antigravity):
-              Controller Speaker: enforced real HID hardware speaker mute + audio-thread voice purge when
+Unreleased    Controller Speaker: enforced real HID hardware speaker mute + audio-thread voice purge when
               Mechanics=0; focused speaker output strictly on authentic in-game RDR2 .awc recordings (hip-holster
               weapon draw/holster, lasso, bow creak, blade/skinning) and crisp mechanical clicks (cocking,
               lever/bolt/pump, live per-round reloads, dry fire, reel clicks, wheel tick, Dead Eye marks).
