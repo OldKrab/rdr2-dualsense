@@ -35,7 +35,7 @@ struct GameSnapshot {
     std::string horse_surface = "ground";
     bool hoof_bones = false;       // the horse's leg bones were found
     float hoof_rate = 0;           // real hoof contacts per second over the last 1.5 s
-    bool in_train = false, in_vehicle = false;
+    bool in_train = false, in_vehicle = false, in_boat = false;
     float speed = 0;
     bool swimming = false;
     float wade = 0, horse_wade = 0;          // how deep in water (0..1 of the body: Arthur / the horse)
@@ -43,9 +43,14 @@ struct GameSnapshot {
     float foliage_height = 0, horse_foliage_height = 0;
     float temperature = 15;
     bool wanted = false;
+    int wanted_score = 0;          // 0..1000+ (scales wanted heartbeat & police LED speed)
     int hour = 12;
     uint32_t weather = 0;
     bool lantern = false;
+    bool carrying = false;         // carrying a body, carcass, or heavy load
+    float near_train_dist = -1;    // distance (m) to a nearby moving train (< 35 m), -1 = none
+    float near_train_speed = 0;
+    float near_train_pan = 0;
     bool wheel = false;            // weapon / item wheel open
     uint32_t wheel_item = 0;          // the item highlighted in the wheel (0 when closed)
     bool ready = true;             // the game: the gun in hand can fire right now (cooldown over, cocked)
@@ -62,6 +67,7 @@ struct GameSnapshot {
     bool lasso_attached = false;
     float lasso_pull = 0;
     int melee_hits = 0;
+    int melee_ko = 0;              // counter: melee knockouts / final blows
     bool melee_target_near = false;
     double time = 0;
 };
@@ -76,6 +82,7 @@ struct WorldEvent {
 class World {
 public:
     void tick();                                     // script thread, every frame
+    void shutdown();                                 // stop background surface worker on unload
     // hoof diagnostics (debug log)
     int hoof_plants_ = 0;
     int foot_plants_ = 0;                // debug: steps felt since foot_stat_t_
@@ -96,7 +103,7 @@ public:
     bool last_ready_ = true;
     int fish_log_state_ = -1;
     int cores_logged_ = -1;
-    bool menu_logged_ = false;
+    bool menu_logged_ = false, aim_logged_ = false;
     // honor (story-mode stats)
     double honor_poll_t_ = 0;
     int honor_ = 0, honor_pos_ = -1, honor_neg_ = -1;
@@ -114,6 +121,8 @@ public:
     double life_poll_t_ = 0, last_apply_t_ = 0, last_interact_t_ = 0, care_until_ = 0, care_start_ = 0, skin_until_ = 0;
     bool smoking_ = false, drinking_ = false, eating_ = false, bathing_ = false;
     uint32_t last_item_ = 0;
+    bool was_on_mount_ = false, was_in_wagon_ = false, mount_seen_ = false;
+    double pluck_t_ = -10;
     std::string care_;
     double ready_change_t_ = 0;
     double hoof_stat_t_ = 0, foot_stat_t_ = 0;
@@ -123,8 +132,8 @@ public:
     void request_greet() { greet_requested_ = true; }   // any thread (voice recognizer)
     enum HorseCommand { HorseNone, HorseCalm, HorseStop, HorseSpur };
     void request_horse(HorseCommand c) { horse_cmd_ = c; }   // any thread (voice recognizer)
-    bool gyro_wants_always = false;
-    bool gyro_enabled = false;
+    std::atomic<bool> gyro_wants_always{false};
+    std::atomic<bool> gyro_enabled{false};
     std::atomic<bool> gyro_stick_busy{false};
 
 private:
@@ -138,7 +147,8 @@ private:
     };
     float pan_to(float x, float y, float cam_heading, float px, float py) const;
     void steps(int ped, Limb* limbs, int n, float body_speed, double now, bool horse, std::vector<WorldEvent>& ev);
-    bool limb_height(Limb& L, float x, float y, float z, float dt, float& h, float& raw_gz);
+    bool limb_height(Limb& L, float x, float y, float z, float dt, float& h, float& raw_gz, uint32_t* mat_out = nullptr);
+    std::string classify_surface(uint32_t mat, int ped);
     static bool touchdown(Limb& L, float h, float dt, float rise_min, float stop, float margin, float swing_max);
     void record_swim(int ped, const char* mode, const int* bones, int n, float speed, double now);
     // swimming: a stroke is a hand / foot / leg that reached forward and starts pulling back (World::strokes)
@@ -186,7 +196,7 @@ private:
     void speech_req(int ped, double now);
     void speech_req_prune(double now);
     void speech_probe(int me, const int* peds, int n, float px, float py, float pz, float cam, double now);
-    int melee_hits_ = 0;
+    int melee_hits_ = 0, melee_ko_ = 0;
     std::atomic<float> gyro_yaw_{0}, gyro_pitch_{0};
     // bodies
     Surfaces surfaces_;
@@ -195,7 +205,7 @@ private:
     Limb feet_[2], hooves_[4];
     int hoof_count_ = 0;
     std::deque<double> hoof_times_;
-    double last_tick_ = 0, air_time_ = 0;
+    double last_tick_ = 0, air_time_ = 0, horse_air_time_ = 0;
     bool was_climbing_ = false, was_door_ = false;
     float step_strength_ = 1;
     float last_step_t_ = 0;

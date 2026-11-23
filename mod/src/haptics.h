@@ -25,6 +25,8 @@ struct Cue {
 
 using Stereo = std::vector<float>;   // interleaved L,R at 48 kHz
 
+enum class SpeakerCategory : uint8_t { None = 0, Mech, Ambient, UI };
+
 class HapticLibrary {
 public:
     void load(const fs::path& recipes_json, GameAudio* game);
@@ -35,19 +37,21 @@ public:
     // Builds "<WEAPON>:shot" from the weapon's own recordings (+ the class's synthesized thump).
     std::string ensure_weapon(const nlohmann::json& profile);
     std::vector<std::vector<int>> kicks(const std::string& name);
-    // Sound for the controller speaker: a labelled game recording for this mechanism if there is one,
-    // else an audible version of the haptic.
+    static SpeakerCategory speaker_category(const std::string& name);
+    // Sound for the controller speaker: a labelled game recording for this cue if there is one,
+    // else an audible version of the haptic (with variant selection and cue.gain scaling).
     bool speaker_sound(const Cue& cue, Stereo& out);
     std::string source(const std::string& name);
 
 private:
-    // audible = the same recipe an octave-and-more up, for the controller's small speaker
-    const std::vector<Stereo>& render_recipe(const std::string& name, int depth, bool audible = false);
-    Stereo synth_layer(const nlohmann::json& layer, float freq_mul = 1.0f, int variant = 0);
+    // audible = the same recipe pitched up (`audible_fm`) for the controller's small speaker
+    const std::vector<Stereo>& render_recipe(const std::string& name, int depth, bool audible = false, float audible_fm = 6.0f);
+    Stereo synth_layer(const nlohmann::json& layer, float freq_mul = 1.0f, int variant = 0, bool audible = false);
 
     nlohmann::json recipes_;
     GameAudio* game_ = nullptr;
     std::map<std::string, std::vector<Stereo>> buffers_;
+    std::map<std::string, Stereo> speaker_cache_;
     std::map<std::string, std::vector<std::vector<int>>> kicks_;
     std::map<std::string, std::string> source_;
     std::recursive_mutex mu_;

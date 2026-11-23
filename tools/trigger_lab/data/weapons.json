@@ -204,8 +204,8 @@
     },
     "bow": {
       "type": "bow", "action_label": "hold R2 to draw, release to loose",
-      "draw": {"start_zone": 2, "position": 1, "rest_strength": 1, "draw_ms": 900, "strength_from": 2,
-               "strength_to": 7, "tremor_after_ms": 2500, "tremor_hz": 9, "tremor_depth": 2,
+      "draw": {"start_zone": 2, "position": 1, "rest_strength": 3, "draw_ms": 900, "strength_from": 4,
+               "strength_to": 8, "tremor_after_ms": 2500, "tremor_hz": 9, "tremor_depth": 2,
                "min_draw": 0.35, "nock": "bow_nock", "creak": "bow_creak"},
       "recoil": {"haptic": "bow_release", "trigger": {"freq": 130, "steps": [6, 3, 1], "step_ms": 14}},
       "rate_ms": 900,
@@ -311,11 +311,11 @@
     {"name": "WEAPON_REVOLVER_DOUBLEACTION", "label": "Double-Action Revolver", "category": "Revolvers", "class": "revolver_da", "bank": "REV_DOUBLE_FINAL", "verified": true,
      "notes": "Long heavy stacking pull, cylinder indexes mid-way, late break - no cocking step."},
     {"name": "WEAPON_REVOLVER_DOUBLEACTION_MICAH", "label": "Micah's Revolver", "category": "Revolvers", "class": "revolver_da", "bank": "REV_DOUBLE_FINAL", "verified": true,
-     "tune": {"fire": {"curve": [0, 2, 3, 3, 4, 5, 6, 8, 0, 0]}}},
+     "tune": {"fire": {"curve": [0, 2, 3, 3, 4, 5, 6, 8, 0, 0], "break_zone": 8}}},
     {"name": "WEAPON_REVOLVER_DOUBLEACTION_GAMBLER", "label": "Granger's Revolver", "category": "Revolvers", "class": "revolver_da", "bank": "REV_DOUBLE_FINAL", "verified": true,
-     "tune": {"fire": {"curve": [0, 1, 2, 3, 4, 5, 6, 7, 0, 0]}}},
+     "tune": {"fire": {"curve": [0, 1, 2, 3, 4, 5, 6, 7, 0, 0], "break_zone": 8}}},
     {"name": "WEAPON_REVOLVER_DOUBLEACTION_EXOTIC", "label": "Algernon's Revolver", "category": "Revolvers", "class": "revolver_da", "bank": "REV_DOUBLE_FINAL", "verified": true,
-     "tune": {"fire": {"curve": [0, 1, 2, 3, 4, 5, 6, 7, 0, 0]}}},
+     "tune": {"fire": {"curve": [0, 1, 2, 3, 4, 5, 6, 7, 0, 0], "break_zone": 8}}},
 
     {"name": "WEAPON_PISTOL_VOLCANIC", "label": "Volcanic Pistol", "category": "Pistols", "class": "pistol_lever", "bank": "PTL_VOLCANIC_FINAL", "verified": true,
      "notes": "Lever-action pistol: light trigger, a small lever to work between shots."},
@@ -373,7 +373,7 @@
     {"name": "WEAPON_BOW", "label": "Bow", "category": "Bows", "class": "bow", "verified": true,
      "notes": "Tension builds with draw time, wavers if held too long; release: slack trigger, string slap right, hand shock left."},
     {"name": "WEAPON_BOW_IMPROVED", "label": "Improved Bow", "category": "Bows", "class": "bow", "verified": false,
-     "tune": {"draw": {"draw_ms": 1000, "strength_to": 8, "tremor_after_ms": 2200}}},
+     "tune": {"draw": {"draw_ms": 1000, "rest_strength": 4, "strength_from": 5, "strength_to": 8, "tremor_after_ms": 2200}}},
 
     {"name": "WEAPON_THROWN_THROWING_KNIVES", "label": "Throwing Knives", "category": "Throwables", "class": "throw_light", "verified": false},
     {"name": "WEAPON_THROWN_THROWING_KNIVES_IMPROVED", "label": "Improved Throwing Knives", "category": "Throwables", "class": "throw_light", "verified": false},
@@ -407,6 +407,7 @@
     {"name": "WEAPON_MELEE_HATCHET", "label": "Hatchet", "category": "Melee", "class": "melee", "verified": false,
      "tune": {"melee": {"swing": "melee_swing_heavy", "impact": "impact_chop", "impact_ms": 170, "miss": "melee_miss_heavy"}}},
     {"name": "WEAPON_MELEE_LANTERN", "label": "Lantern", "category": "Tools", "class": "tool", "verified": false},
+    {"name": "WEAPON_MELEE_DAVY_LANTERN", "label": "Electric Lantern", "category": "Tools", "class": "tool", "verified": false},
     {"name": "WEAPON_MELEE_TORCH", "label": "Torch", "category": "Melee", "class": "melee", "verified": false,
      "tune": {"melee": {"swing": "melee_swing_heavy", "impact": "impact_blunt", "impact_ms": 170, "miss": "melee_miss_heavy"}}},
 

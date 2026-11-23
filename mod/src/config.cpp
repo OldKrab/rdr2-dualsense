@@ -120,9 +120,9 @@ TableGames=0.7
 ; The little click of L2/R2 while browsing the weapon wheel (0 = off)
 WheelClick=0.6
 ; Camp life: bites, sips and puffs, cleaning your gun, brushing / feeding the horse, skinning, stowing pelts,
-; picking herbs, bathing, crafting, cooking
+; picking herbs, bathing, crafting, cooking, carrying bodies
 CampLife=0.6
-; Rain drops on the hat, one by one, as heavy as the game's rain (0 = off)
+; Rain / hail drops, storm wind gusts, distant thunder (0 = off)
 Weather=0.3
 ; EXPERIMENTAL - dialogue haptics: every spoken line felt as the speaker's voice (its rhythm and intonation, from
 ; their side). Dialogue = on / off, Speech = its strength, DialogueIn = everywhere / cutscenes
@@ -134,14 +134,19 @@ DialogueIn=everywhere
 SoundDelayMs=auto
 
 [Speaker]
-; Holster, lasso, cocking, lever, bolt and reload sounds from the controller's speaker (off by default)
+; Sounds from the controller speaker: gun/bow/lasso mechanics, reloads, and crisp mechanical clicks (off by default)
 Mechanics=0
+; Sub-categories when Mechanics=1 (set 0 to mute a category on the speaker)
+Ambient=1
+UI=1
 Volume=0.35
 
 [Lightbar]
 Enabled=1
 Brightness=1.0
-; Player LEDs show the rounds left
+; Player LEDs below the touchpad: auto (ammo when armed, health changes when unarmed), health, ammo, or off
+PlayerLeds=auto
+; Legacy toggle (0 turns player LEDs off)
 AmmoLeds=1
 ; Ambient colour follows the time of day when nothing else is shown
 TimeOfDay=1
@@ -210,24 +215,32 @@ TwoFingerTap=
 
 bool Config::load(const std::wstring& path) {
     std::map<std::string, std::string> values;
-    std::ifstream in{std::filesystem::path(path)};
-    if (!in) {
-        std::ofstream out{std::filesystem::path(path)};
-        out << default_text();
-        out.close();
-        in.open(std::filesystem::path(path));
-    }
     std::string text;
-    if (in) {
-        std::stringstream ss;
-        ss << in.rdbuf();
-        text = ss.str();
-    } else {
-        text = default_text();
-    }
+    {
+        std::ifstream in{std::filesystem::path(path)};
+        if (!in) {
+            std::ofstream out{std::filesystem::path(path)};
+            out << default_text();
+            out.close();
+            in.open(std::filesystem::path(path));
+        }
+        if (in) {
+            std::stringstream ss;
+            ss << in.rdbuf();
+            text = ss.str();
+        } else {
+            text = default_text();
+        }
+    }   // close file handle before migrate() / MoveFileExW() runs
     std::istringstream lines(text);
     std::string line, section;
+    bool first_line = true;
     while (std::getline(lines, line)) {
+        if (first_line) {
+            first_line = false;
+            if (line.size() >= 3 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF)
+                line.erase(0, 3);
+        }
         line = trim(line);
         if (line.empty() || line[0] == ';' || line[0] == '#') continue;
         if (line.front() == '[' && line.back() == ']') {
@@ -238,7 +251,7 @@ bool Config::load(const std::wstring& path) {
         if (eq == std::string::npos) continue;
         std::string key = lower(trim(line.substr(0, eq)));
         std::string val = trim(line.substr(eq + 1));
-        size_t c = val.find(" ;");
+        size_t c = std::min(val.find(" ;"), val.find("\t;"));
         if (c != std::string::npos) val = trim(val.substr(0, c));
         values[section + "." + key] = val;
     }
@@ -292,55 +305,83 @@ void Config::migrate() {
 }
 
 bool Config::set(const std::string& section, const std::string& key, const std::string& value) {
+    return set_many({{section, key, value}});
+}
+
+bool Config::set_many(const std::vector<std::tuple<std::string, std::string, std::string>>& updates) {
+    if (updates.empty()) return true;
     std::wstring path_copy;
     {
-        std::shared_lock<std::shared_mutex> l(mu_);
-        path_copy = path_;
-    }
-    if (path_copy.empty()) return false;
-    std::vector<std::string> lines;
-    {
-        std::ifstream in{std::filesystem::path(path_copy)};
-        for (std::string l; std::getline(in, l);) {
-            if (!l.empty() && l.back() == '\r') l.pop_back();
-            lines.push_back(l);
+        std::lock_guard<std::mutex> wl(write_mu_);
+        {
+            std::shared_lock<std::shared_mutex> l(mu_);
+            path_copy = path_;
         }
-    }
-    std::string want_s = lower(section), want_k = lower(key), cur;
-    int section_end = -1, section_line = -1;
-    bool done = false;
-    for (size_t i = 0; i < lines.size() && !done; ++i) {
-        std::string t = trim(lines[i]);
-        if (!t.empty() && t.front() == '[' && t.back() == ']') {
-            if (cur == want_s) section_end = int(i);          // left our section: insert before here if needed
-            cur = lower(trim(t.substr(1, t.size() - 2)));
-            if (cur == want_s) section_line = int(i);
-            continue;
+        if (path_copy.empty()) return false;
+        std::filesystem::path fpath(path_copy);
+        std::vector<std::string> lines;
+        {
+            std::ifstream in{fpath};
+            if (!in) {
+                std::error_code ec;
+                if (std::filesystem::exists(fpath, ec)) return false;   // never wipe an existing ini on transient open failure
+            } else {
+                bool first = true;
+                for (std::string l; std::getline(in, l);) {
+                    if (first) {
+                        first = false;
+                        if (l.size() >= 3 && (unsigned char)l[0] == 0xEF && (unsigned char)l[1] == 0xBB && (unsigned char)l[2] == 0xBF)
+                            l.erase(0, 3);
+                    }
+                    if (!l.empty() && l.back() == '\r') l.pop_back();
+                    lines.push_back(std::move(l));
+                }
+            }
         }
-        if (cur != want_s || t.empty() || t[0] == ';' || t[0] == '#') continue;
-        size_t eq = t.find('=');
-        if (eq == std::string::npos || lower(trim(t.substr(0, eq))) != want_k) continue;
-        size_t c = lines[i].find(" ;");                          // keep a trailing comment
-        std::string tail = c != std::string::npos ? lines[i].substr(c) : "";
-        lines[i] = trim(t.substr(0, eq)) + "=" + value + tail;
-        done = true;
-    }
-    if (!done) {
-        if (section_line < 0) {
-            if (!lines.empty() && !trim(lines.back()).empty()) lines.push_back("");
-            lines.push_back("[" + section + "]");
-            lines.push_back(key + "=" + value);
-        } else {
-            int at = section_end >= 0 ? section_end : int(lines.size());
-            while (at > section_line + 1 && trim(lines[at - 1]).empty()) --at;   // before the blank gap
-            lines.insert(lines.begin() + at, key + "=" + value);
+        for (const auto& [section, key, value] : updates) {
+            std::string want_s = lower(section), want_k = lower(key), cur;
+            int section_end = -1, section_line = -1;
+            bool done = false;
+            for (size_t i = 0; i < lines.size() && !done; ++i) {
+                std::string t = trim(lines[i]);
+                if (!t.empty() && t.front() == '[' && t.back() == ']') {
+                    if (cur == want_s) section_end = int(i);
+                    cur = lower(trim(t.substr(1, t.size() - 2)));
+                    if (cur == want_s) section_line = int(i);
+                    continue;
+                }
+                if (cur != want_s || t.empty() || t[0] == ';' || t[0] == '#') continue;
+                size_t eq = t.find('=');
+                if (eq == std::string::npos || lower(trim(t.substr(0, eq))) != want_k) continue;
+                size_t c = std::min(lines[i].find(" ;"), lines[i].find("\t;"));
+                std::string tail = c != std::string::npos ? lines[i].substr(c) : "";
+                lines[i] = trim(t.substr(0, eq)) + "=" + value + tail;
+                done = true;
+            }
+            if (!done) {
+                if (section_line < 0) {
+                    if (!lines.empty() && !trim(lines.back()).empty()) lines.push_back("");
+                    lines.push_back("[" + section + "]");
+                    lines.push_back(key + "=" + value);
+                } else {
+                    int at = section_end >= 0 ? section_end : int(lines.size());
+                    while (at > section_line + 1 && trim(lines[at - 1]).empty()) --at;
+                    lines.insert(lines.begin() + at, key + "=" + value);
+                }
+            }
         }
-    }
-    {
-        std::ofstream out{std::filesystem::path(path_copy), std::ios::binary | std::ios::trunc};
-        for (auto& l : lines) out << l << "\r\n";
-        if (!out) return false;
-    }
+        std::wstring tmp_path = path_copy + L".tmp";
+        {
+            std::ofstream out{std::filesystem::path(tmp_path), std::ios::binary | std::ios::trunc};
+            for (auto& l : lines) out << l << "\r\n";
+            out.flush();
+            if (!out) return false;
+        }
+        if (!MoveFileExW(tmp_path.c_str(), path_copy.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DeleteFileW(tmp_path.c_str());
+            return false;
+        }
+    }   // release write_mu_ before load() / migrate() so migration can never deadlock
     return load(path_copy);
 }
 
@@ -360,7 +401,7 @@ float Config::num(const std::string& s, const std::string& k, float def) const {
     const char* b = v.data();
     while (*b == ' ' || *b == '+') ++b;
     auto r = std::from_chars(b, v.data() + v.size(), out);
-    return r.ec == std::errc() ? out : def;
+    return (r.ec == std::errc() && std::isfinite(out)) ? out : def;
 }
 
 int Config::integer(const std::string& s, const std::string& k, int def) const {

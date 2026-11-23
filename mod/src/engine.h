@@ -53,6 +53,7 @@ struct GameHints {
     bool lasso_attached = false;
     float lasso_pull = 0;           // 0-1 how hard the catch pulls
     int melee_hits = 0;             // counter: damage the player dealt in melee range
+    int melee_ko = 0;               // counter: melee knockouts / final blows
     bool melee_target_near = false;
     bool hip_fire = true;           // not aiming down the sights
     bool dual_wield = false;        // two guns: the game alternates them
@@ -117,8 +118,10 @@ private:
     std::string id_, kind_, mode_, bank_, shot_haptic_, empty_feel_;
     Zones curve_{}, after_curve_{}, action_curve_{};
     std::array<int, 3> weapon_fx_{4, 6, 6}, simple_fx_{100, 160, 200};
-    int break_raw_ = 0, reset_raw_ = 0, stop_zone_ = 0, stop_strength_ = 8, action_break_raw_ = 0;
-    float grit_ = 0, lock_s_ = 0.005f, rate_s_ = 0.4f, haptic_gain_ = 1.0f;
+    int break_raw_ = 0, break_zone_ = 6, reset_raw_ = 0, stop_zone_ = 0, stop_strength_ = 8, action_break_raw_ = 0;
+    bool reset_click_ = true, action_fan_ = false;
+    float grit_ = 0, lock_s_ = 0.005f, rate_s_ = 0.4f, haptic_gain_ = 1.0f, action_min_s_ = 0.12f;
+    std::string pre_cue_, action_type_ = "none", action_open_, action_close_;
     Kick kick_;
     std::vector<std::vector<int>> kick_variants_;
     std::map<int, nlohmann::json> ticks_, action_ticks_;
@@ -130,7 +133,7 @@ private:
     std::string state_ = "ready";
     int game_rt_ = 0;
     double shot_t_ = -10, kick_t_ = -10, action_t_ = -10, reload_t_ = -10, draw_t_ = -10, tether_t_ = -10;
-    int reload_ticks_done_ = 0, reload_rounds_ = 0;
+    int reload_ticks_done_ = 0, reload_rounds_ = 0, reload_clip_ = -1, reload_start_clip_ = -1;
     bool last_dry_ = false, dead_eye_ = false;
     int prev_raw_ = 0;
     double prev_t_ = 0;
@@ -152,9 +155,14 @@ private:
     int hand_ = -1, combo_ = 0;
     std::string last_strike_;
     // in-game melee confirmation
-    struct Strike { double deadline; float pan; int hits_at_start; bool done; };
+    struct Strike { double deadline; float pan; int hits_at_start; int ko_at_start; bool done; };
     std::vector<Strike> strikes_;
-    int last_melee_hits_ = 0;
+    double melee_kick_until_ = -10;
+    int melee_kick_amp_ = 0;
+    bool melee_kick_both_ = false;
+    int melee_hits_seen_ = -1, melee_ko_seen_ = -1;
+    int bow_creak_stage_ = 0;
+    double bow_strain_t_ = -10;
     // fire-rate sync: shots the game did not take
     double unconfirmed_since_ = -1;
     bool ready_usable_ = true;      // false if the game's readiness signal doesn't behave for this gun
@@ -170,6 +178,7 @@ private:
     bool fish_bite_ = false;
     float fish_peak_ = 0, reel_acc_ = 0;
     double fish_t_ = 0, bite_until_ = 0, nibble_until_ = 0, next_surge_ = 0, next_flop_ = 0, flop_until_ = 0;
+    double cast_start_t_ = -1, cast_pulse_until_ = -10;
     float game_grit_ = 0, game_tremor_ = 0, game_kick_mult_ = 1;
     // in game the kick comes with the game's real shot, not with the break
     bool in_game_ = false;

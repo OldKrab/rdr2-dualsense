@@ -269,6 +269,7 @@ static float ammo_kick(uint32_t ammo) {
 // ---------------- camp life ----------------
 // item-interaction states that mean eating, drinking, smoking, cleaning a gun
 static const char* item_kind(uint32_t state) {
+    if (!state) return "";
     struct Entry { uint32_t hash; const char* kind; };
     static const Entry kStates[] = {
 #include "item_states.inc"
@@ -276,6 +277,10 @@ static const char* item_kind(uint32_t state) {
     for (const auto& e : kStates)
         if (e.hash == state) return e.kind;
     return "";
+}
+
+void World::shutdown() {
+    surfaces_.shutdown();
 }
 
 // ---------------- bodies: footfalls from the real legs ----------------
@@ -299,14 +304,18 @@ void World::bind_limbs(int ped, Limb* limbs, int n, const char* const* names, in
     LOGI("%s: %d leg bones found", limbs == feet_ ? "player feet" : "horse hooves", found);
 }
 
+std::string World::classify_surface(uint32_t mat, int ped) {
+    bool indoors = nat::GET_INTERIOR_FROM_ENTITY(ped) != 0;
+    float sub = nat::GET_ENTITY_SUBMERGED_LEVEL(ped);
+    return surfaces_.classify(mat, indoors, sub, indoors ? 0.0f : nat::GET_SNOW_LEVEL());
+}
+
 std::string World::surface_at(float x, float y, float z, int ped, uint32_t* mat_out) {
     float gz = 0;
     nat::Hash mat = 0;
     nat::GET_GROUND_Z_AND_MATERIAL(x, y, z + 0.5f, &gz, &mat);
     if (mat_out) *mat_out = mat;
-    bool indoors = nat::GET_INTERIOR_FROM_ENTITY(ped) != 0;
-    float sub = nat::GET_ENTITY_SUBMERGED_LEVEL(ped);
-    return surfaces_.classify(mat, indoors, sub, indoors ? 0.0f : nat::GET_SNOW_LEVEL());
+    return classify_surface(mat, ped);
 }
 
 // A foot that comes to rest in world space has just been planted: that is the step.
@@ -407,10 +416,11 @@ void World::strokes(int ped, Stroke* limbs, int n, bool horse, float speed, std:
 // to ~0.3 s (20% of the readings under a galloping horse). A reading that puts the limb under the ground, or jumps
 // up under it, is dropped while it is short-lived and the last plausible ground is kept; a lasting offset is real
 // (sunk into deep snow) and is taken after 0.4 s. False = no ground known yet.
-bool World::limb_height(Limb& L, float x, float y, float z, float dt, float& h, float& raw_gz) {
+bool World::limb_height(Limb& L, float x, float y, float z, float dt, float& h, float& raw_gz, uint32_t* mat_out) {
     float gz = 0;
     nat::Hash mat = 0;
     bool got = nat::GET_GROUND_Z_AND_MATERIAL(x, y, z + 0.5f, &gz, &mat) && gz != 0;
+    if (mat_out) *mat_out = mat;
     raw_gz = got ? gz : 0;
     bool plausible = got && (L.held > 0.4f || (gz <= z + 0.05f && (!L.have_gz || gz - L.good_gz < 0.25f)));
     if (plausible) {
@@ -501,29 +511,31 @@ void World::steps(int ped, Limb* limbs, int n, float body_speed, double now, boo
         Limb& L = limbs[i];
         if (L.bone < 0) continue;
         // Self-healing: tracking resumes after a pause (riding, swimming, a cutscene - the ground under it is somewhere
-        // else now), or no touchdown for 2 s while moving (a stuck state: the left foot fell silent for good once):
-        // start the limb's detector afresh.
-        if (now - L.last_seen > 0.5 || (body_speed > 1.0f && L.have_h && now - L.last_td > 2.0 && now - L.reset_t > 2.0)) {
-            if (now - L.last_seen <= 0.5) LOGD("steps: %s %d silent for 2 s while moving - detector restarted", horse ? "hoof" : "foot", i);
+        // else now), or no touchdown for 2.0 s while moving (restart detector cleanly).
+        if (now - L.last_seen > 0.5 || (body_speed > 0.95f && L.have_h && now - L.last_td > 2.0 && now - L.reset_t > 2.0)) {
+            if (now - L.last_seen <= 0.5) LOGD("steps: %s %d silent for 2.0 s while moving - detector restarted", horse ? "hoof" : "foot", i);
             int bone = L.bone;
             L = Limb{};
             L.bone = bone;
             L.reset_t = L.last_td = now;
         }
         L.last_seen = now;
+        if (!horse && body_speed < 1.8f && L.td == 0)
+            L.swing = std::max(0.12f, L.swing * std::exp(-float(dt) / 0.8f));
         nat::Vector3 p = nat::GET_WORLD_POSITION_OF_ENTITY_BONE(ped, L.bone);
         float h = 0;
-        bool known = limb_height(L, p.x, p.y, p.z, float(dt), h, rgz[i]);
+        uint32_t mat = 0;
+        bool known = limb_height(L, p.x, p.y, p.z, float(dt), h, rgz[i], &mat);
         if (rec) {
             rx[i] = p.x;
             ry[i] = p.y;
             rz[i] = p.z;
         }
         if (!known) continue;
-        // a hoof that lifts 4 cm has stepped; a foot needs 7 cm (a walking foot shuffles a few cm on uneven ground)
+        // a hoof that lifts 4 cm has stepped; a foot needs 5.5 cm (slow camp steps lift ~5.5-6.5 cm)
         // and its fall must have all but stopped (a walking foot creeps the last centimetres down: fired too early)
         bool down = horse ? touchdown(L, h, float(dt), 0.04f, 0.4f, 0.65f, 1.0f)
-                          : touchdown(L, h, float(dt), 0.07f, 0.1f, 0.5f, 0.6f);
+                          : touchdown(L, h, float(dt), 0.055f, 0.12f, 0.55f, 0.6f);
         if (!down) continue;
         // the same limb can't land twice within 0.15 s (hooves) / 0.2 s (feet): a double hit
         bool double_hit = now - L.last_td < (horse ? 0.15 : 0.2);
@@ -531,7 +543,7 @@ void World::steps(int ped, Limb* limbs, int n, float body_speed, double now, boo
         if (double_hit || body_speed <= 0.4f) continue;
         rp[i] = true;
         L.last_plant = now;
-        WorldEvent e{horse ? WorldEvent::Hoof : WorldEvent::Footstep, 0, 1, surface_at(p.x, p.y, p.z, ped)};
+        WorldEvent e{horse ? WorldEvent::Hoof : WorldEvent::Footstep, 0, 1, classify_surface(mat, ped)};
         if (horse) {
             hoof_times_.push_back(now);
             e.pan = (i % 2) ? 0.25f : -0.25f;                              // hooves: around the centre
@@ -610,7 +622,7 @@ void World::greet(int pl, int me, float px, float py, const int* peds, int n, co
         int t = reply_target_;
         reply_target_ = 0;
         std::string used;
-        if (!IS_PED_DEAD_OR_DYING(t) && speak(t, {"GREET_GENERAL_STRANGER", "GREET_GENERAL"}, me, &used))
+        if (DOES_ENTITY_EXIST(t) && !IS_PED_DEAD_OR_DYING(t) && speak(t, {"GREET_GENERAL_STRANGER", "GREET_GENERAL"}, me, &used))
             LOGI("greeting: they answered (%s)", used.c_str());
     }
     bool requested = greet_requested_.exchange(false);
@@ -618,7 +630,8 @@ void World::greet(int pl, int me, float px, float py, const int* peds, int n, co
         LOGI("greeting: %s", why);
         int t = greet_target_;
         greet_ = Greet::Idle;
-        if (t && config().flag("Voice", "SpeechFallback", true) && !IS_PED_DEAD_OR_DYING(t)) speech_greet(me, t, s, ev);
+        if (t && DOES_ENTITY_EXIST(t) && config().flag("Voice", "SpeechFallback", true) && !IS_PED_DEAD_OR_DYING(t))
+            speech_greet(me, t, s, ev);
     };
     if (greet_ != Greet::Idle && (s.blocked || IS_PLAYER_FREE_AIMING(pl))) {
         greet_ = Greet::Idle;
@@ -651,6 +664,10 @@ void World::greet(int pl, int me, float px, float py, const int* peds, int n, co
         greet_from_ = GET_GAMEPLAY_CAM_RELATIVE_HEADING();
     }
     if (greet_ == Greet::Idle) return;
+    if (!greet_target_ || !DOES_ENTITY_EXIST(greet_target_) || IS_PED_DEAD_OR_DYING(greet_target_)) {
+        greet_ = Greet::Idle;
+        return;
+    }
     Vector3 q = GET_ENTITY_COORDS(greet_target_);
     float want = wrap180(std::atan2(-(q.x - px), q.y - py) * 180.0f / kPi - GET_ENTITY_HEADING(me));
     switch (greet_) {
@@ -746,6 +763,15 @@ void World::tick() {
     Player pl = PLAYER_ID();
     Ped me = PLAYER_PED_ID();
     if (!me || !IS_PLAYER_PLAYING(pl)) {
+        last_health_ = -1;
+        mount_seen_ = was_on_mount_ = was_in_wagon_ = false;
+        air_time_ = horse_air_time_ = 0;
+        last_item_ = 0;
+        care_until_ = skin_until_ = rein_until_ = 0;
+        spurs_left_ = 0;
+        ped_health_.clear();
+        hit_by_me_t_.clear();
+        ped_shot_t_.clear();
         std::lock_guard<std::mutex> l(mu_);
         snap_ = s;
         return;
@@ -773,16 +799,28 @@ void World::tick() {
     float cam = GET_GAMEPLAY_CAM_ROT().z;
 
     // --- weapon ---
+    static const Hash kUnarmed = joaat("WEAPON_UNARMED");
+    static const Hash kWeaponObject = joaat("WEAPON_OBJECT");   // non-weapon looted/carried item in hand
+    static const Hash kLantern = joaat("WEAPON_MELEE_LANTERN");
+    static const Hash kDavyLantern = joaat("WEAPON_MELEE_DAVY_LANTERN");
+    static const Hash kFishingRod = joaat("WEAPON_FISHINGROD");
+    static const Hash kGroupUnarmed = joaat("GROUP_UNARMED");
+    static const Hash kGroupMelee = joaat("GROUP_MELEE");
     Hash w = 0;
     GET_CURRENT_PED_WEAPON(me, &w);
+    Hash w_group = (w && w != kUnarmed && w != kWeaponObject) ? GET_WEAPONTYPE_GROUP(w) : 0;
+    if (!w_group || w_group == kGroupUnarmed || w == kWeaponObject) {
+        w = kUnarmed;
+        w_group = kGroupUnarmed;
+    }
     s.weapon = w;
-    s.group = w ? GET_WEAPONTYPE_GROUP(w) : 0;
-    s.armed = w && w != joaat("WEAPON_UNARMED");
-    s.lantern = w == joaat("WEAPON_MELEE_LANTERN") || w == joaat("WEAPON_MELEE_DAVY_LANTERN");
+    s.group = w_group;
+    s.armed = (w != 0 && w != kUnarmed);
+    s.lantern = w == kLantern || w == kDavyLantern;
     s.attach_point = s.armed ? GET_DEFAULT_WEAPON_ATTACH_POINT(w) : -1;
     {
         Hash off = 0;
-        s.dual_wield = s.armed && GET_CURRENT_PED_WEAPON_AT(me, &off, 1) && off && off != joaat("WEAPON_UNARMED");
+        s.dual_wield = s.armed && GET_CURRENT_PED_WEAPON_AT(me, &off, 1) && off && off != kUnarmed;
         if (s.dual_wield != dual_logged_) {
             LOGD("dual wield: %d (off hand 0x%08X)", int(s.dual_wield), off);
             dual_logged_ = s.dual_wield;
@@ -799,7 +837,7 @@ void World::tick() {
         }
     }
     // fishing: the game's own fishing task (read only - the fishing script writes it back every frame)
-    if (w == joaat("WEAPON_FISHINGROD")) {
+    if (w == kFishingRod) {
         alignas(8) uint64_t buf[32] = {};
         FishingState& f = s.fishing;
         f.active = GET_TASK_FISHING(me, buf);
@@ -824,6 +862,7 @@ void World::tick() {
     } else {
         fish_log_state_ = -1;
     }
+    s.dead_eye = IS_SPECIAL_ABILITY_ACTIVE(pl);
     s.deadeye_marks = s.dead_eye ? GET_NUM_MARKED_DEADEYE_TARGETS(pl) : 0;
     if (s.deadeye_marks != marks_logged_) {
         LOGD("dead eye: %d marked", s.deadeye_marks);
@@ -844,7 +883,13 @@ void World::tick() {
     s.free_aim = IS_PLAYER_FREE_AIMING(pl);
     s.lock_on = IS_PLAYER_TARGETTING_ANYTHING(pl);
     s.aiming = s.free_aim || s.lock_on;
-    s.dead_eye = IS_SPECIAL_ABILITY_ACTIVE(pl);
+    if (log::debug_enabled() && s.aiming != aim_logged_) {
+        aim_logged_ = s.aiming;
+        int rx = 0, ry = 0;
+        input().raw_rstick(rx, ry);
+        LOGD("aim state: free_aim %d, lock_on %d, armed %d, cam pitch %.2f, rstick raw (%d, %d), gyro_on %d",
+             int(s.free_aim), int(s.lock_on), int(s.armed), GET_GAMEPLAY_CAM_ROT().x, rx, ry, int(gyro_enabled.load()));
+    }
     // low health = Arthur's real health (the ring), like the game's own warning - not the core, which can be
     // empty while the health is full. A fortified (gold) ring or core counts as healthy.
     bool gold_health = IS_ATTRIBUTE_CORE_OVERPOWERED(me, 0) || IS_ATTRIBUTE_OVERPOWERED(me, 0);
@@ -889,7 +934,8 @@ void World::tick() {
     Ped horse = s.on_mount ? GET_MOUNT(me) : 0;
     if (horse) {
         s.mount_speed = GET_ENTITY_SPEED(horse);
-        s.mount_stamina = GET_ATTRIBUTE_CORE_VALUE(horse, 1);
+        bool gold_h_stam = IS_ATTRIBUTE_CORE_OVERPOWERED(horse, 1) || IS_ATTRIBUTE_OVERPOWERED(horse, 1);
+        s.mount_stamina = gold_h_stam ? 100 : GET_ATTRIBUTE_CORE_VALUE(horse, 1);
         s.mount_pitch = GET_ENTITY_ROTATION(horse).x;
         s.horse_wade = GET_ENTITY_SUBMERGED_LEVEL(horse);
         s.horse_foliage = _GET_PED_BLACKBOARD_BOOL(horse, "FoliageActive");
@@ -898,19 +944,32 @@ void World::tick() {
             horse_foliage_logged_ = s.horse_foliage;
             LOGD("foliage: the horse %s (height %.2f)", s.horse_foliage ? "pushing through" : "out", s.horse_foliage_height);
         }
-        Vector3 hp = GET_ENTITY_COORDS(horse);
-        s.horse_surface = surface_at(hp.x, hp.y, hp.z, horse);
+        Vector3 hpos = GET_ENTITY_COORDS(horse);
+        s.horse_surface = surface_at(hpos.x, hpos.y, hpos.z, horse);
+        bool horse_swims = IS_PED_SWIMMING(horse);
+        if (log::debug_enabled() && horse_swims != horse_swim_logged_) {
+            horse_swim_logged_ = horse_swims;
+            LOGD("swim: the horse %s", horse_swims ? "swims" : "is out of the water");
+        }
+        // horse jump / landing impact
+        if (!s.halted && !horse_swims) {
+            bool h_air = IS_ENTITY_IN_AIR(horse) || IS_PED_FALLING(horse);
+            double hdt = s.time - last_tick_;
+            if (h_air && hdt > 0 && hdt < 0.1) horse_air_time_ += hdt;
+            if (!h_air) {
+                if (horse_air_time_ > 0.28)
+                    ev.push_back({WorldEvent::Land, 0, clampv(float(horse_air_time_) / 1.0f, 0.4f, 1.0f), s.horse_surface});
+                horse_air_time_ = 0;
+            }
+        } else {
+            horse_air_time_ = 0;
+        }
         if (horse != hooves_horse_) {
             hooves_horse_ = horse;
             bind_limbs(horse, hooves_, 4, kHoofBones, 8);
             hoof_times_.clear();
         }
         s.hoof_bones = hoof_count_ >= 2;
-        bool horse_swims = IS_PED_SWIMMING(horse);
-        if (log::debug_enabled() && horse_swims != horse_swim_logged_) {
-            horse_swim_logged_ = horse_swims;
-            LOGD("swim: the horse %s", horse_swims ? "swims" : "is out of the water");
-        }
         if (horse_swims && hoof_count_ == 4 && !s.halted) {
             if (!horse_swim_was_ || horse != paddle_horse_) {          // a fresh swim: start the legs' detectors anew
                 paddle_horse_ = horse;
@@ -927,7 +986,7 @@ void World::tick() {
         }
         horse_swim_was_ = horse_swims;
         size_t before = ev.size();
-        if (s.hoof_bones) steps(horse, hooves_, hoof_count_, s.mount_speed, s.time, true, ev);
+        if (s.hoof_bones && !s.halted && !horse_swims) steps(horse, hooves_, hoof_count_, s.mount_speed, s.time, true, ev);
         hoof_plants_ += int(ev.size() - before);
         s.hoof_rate = float(hoof_times_.size()) / 1.5f;
         if (log::debug_enabled() && s.time - hoof_stat_t_ > 3.0) {
@@ -939,10 +998,40 @@ void World::tick() {
             hoof_stat_t_ = s.time;
         }
     }
-    if (!horse) horse_swim_was_ = false;
+    if (!horse) {
+        horse_swim_was_ = false;
+        horse_air_time_ = 0;
+    }
     s.in_train = IS_PED_IN_ANY_TRAIN(me);
+    s.in_boat = IS_PED_IN_ANY_BOAT(me);
     s.in_vehicle = IS_PED_IN_ANY_VEHICLE(me);
     s.speed = GET_ENTITY_SPEED(me);
+    s.carrying = IS_PED_CARRYING_SOMETHING(me);
+    // mounting / dismounting a horse or climbing onto / off a wagon (excluding trains and boats)
+    const bool in_wagon = s.in_vehicle && !s.in_train && !s.in_boat;
+    if (!s.halted) {
+        if (mount_seen_) {
+            if (s.on_mount && !was_on_mount_) {
+                ev.push_back({WorldEvent::Horse, 0.0f, 1.0f, "mount"});
+                LOGD("mounted horse");
+            } else if (!s.on_mount && was_on_mount_ && !s.swimming && !IS_PED_RAGDOLL(me)) {
+                ev.push_back({WorldEvent::Horse, 0.0f, 0.75f, "dismount"});
+                LOGD("dismounted horse");
+            }
+            if (in_wagon && !was_in_wagon_) {
+                ev.push_back({WorldEvent::Life, 0.0f, 1.0f, "wagon_mount"});
+                LOGD("mounted wagon / vehicle");
+            } else if (!in_wagon && was_in_wagon_ && !s.swimming && !IS_PED_RAGDOLL(me)) {
+                ev.push_back({WorldEvent::Life, 0.0f, 0.75f, "wagon_dismount"});
+                LOGD("dismounted wagon / vehicle");
+            }
+        }
+        was_on_mount_ = s.on_mount;
+        was_in_wagon_ = in_wagon;
+        mount_seen_ = true;
+    } else {
+        mount_seen_ = false;
+    }
 
     // --- swimming: strokes from the real arms and legs, a splash for a jump into water ---
     const float falling = -GET_ENTITY_VELOCITY(me).z;                 // falling speed (m/s), the fastest in 0.5 s
@@ -979,8 +1068,8 @@ void World::tick() {
             feet_ped_ = me;
             bind_limbs(me, feet_, 2, kFootBones, 2);
         }
-        bool crouch = GET_PED_CROUCH_MOVEMENT(me), carry = IS_PED_CARRYING_SOMETHING(me);
-        step_strength_ = (crouch ? 0.55f : 1.0f) * (carry ? 1.25f : 1.0f);
+        bool crouch = GET_PED_CROUCH_MOVEMENT(me);
+        step_strength_ = (crouch ? 0.55f : 1.0f) * (s.carrying ? 1.25f : 1.0f);
         size_t before_steps = ev.size();
         steps(me, feet_, 2, s.speed, s.time, false, ev);
         if (ev.size() > before_steps) {
@@ -1017,8 +1106,14 @@ void World::tick() {
 
     // --- world ---
     s.hour = GET_CLOCK_HOURS();
-    s.weather = GET_PREV_WEATHER_TYPE_HASH_NAME();
-    s.wanted = IS_LAW_INCIDENT_ACTIVE(pl) || GET_WANTED_SCORE(pl) > 0;
+    {
+        Hash wa = 0, wb = 0;
+        float wpct = 0;
+        GET_CURR_WEATHER_STATE(&wa, &wb, &wpct);
+        s.weather = (wb && wpct >= 0.5f) ? wb : (wa ? wa : GET_PREV_WEATHER_TYPE_HASH_NAME());
+    }
+    s.wanted_score = GET_WANTED_SCORE(pl);
+    s.wanted = IS_LAW_INCIDENT_ACTIVE(pl) || s.wanted_score > 0;
 
     // --- lasso ---
     Entity target = GET_LASSO_TARGET(me);
@@ -1067,34 +1162,85 @@ void World::tick() {
     int peds[256];
     int n = shv_worldGetAllPeds(peds, 256);
     Ped melee_target = GET_MELEE_TARGET_FOR_PED(me);
-    // Who really damaged whom just now: the game's own damage events (EVENT_ENTITY_DAMAGED: [0] damaged, [1] by whom),
-    // read only. The "has X ever damaged Y" record lasts forever - a gunman from minutes ago turned every later bit
-    // of health drain (a tonic's gold wearing off) into a felt hit.
+    // --- single pass over the game's AI event queue (damage, horse care, looting, carrying) ---
     {
-        static const Hash kDamaged = 0x18010D37;       // EVENT_ENTITY_DAMAGED
+        static const Hash kDamaged = 0x18010D37;      // EVENT_ENTITY_DAMAGED: [0] victim, [1] attacker
+        static const Hash kCalmPed = 0x89AB08C3;      // calmer, mount, calm type, fully calmed
+        static const Hash kPrompt = 0x52AE9189;       // EVENT_PLAYER_PROMPT_TRIGGERED: [0] prompt type (49 brush, 50 feed)
+        static const Hash kCalcLoot = 0x834F764A;     // EVENT_CALCULATE_LOOT: [23] looter, [24] looted entity
+        static const Hash kLoot = 0xA5E4EAF7;         // EVENT_LOOT: [26] looter, [29] herb (non-zero = a plant)
+        static const Hash kLootDone = 0x52063E5B;     // EVENT_LOOT_COMPLETE: [0] looter, [1] entity, [2] success
+        static const Hash kPickup = 0xD7092502;       // EVENT_PICKUP_CARRIABLE: [0] carrier, [2] taken from a horse
+        static const Hash kStow = 0x4086BF1A;         // EVENT_PLACE_CARRIABLE_ONTO_PARENT: [0] player, [2] horse
         int n_ev = GET_NUMBER_OF_EVENTS(0);
         for (int i = 0; i < n_ev; ++i) {
-            if (GET_EVENT_AT_INDEX(0, i) != kDamaged) continue;
-            alignas(8) uint64_t d[9] = {};
-            if (!GET_EVENT_DATA(0, i, d, 9)) continue;
-            const int victim = int(uint32_t(d[0])), by = int(uint32_t(d[1]));
-            if (victim == me) {
-                if (log::debug_enabled() && s.time - damaged_me_t_ > 0.3)
-                    LOGD("damage event: Arthur hurt by %s", !by ? "nothing (fall, fire...)" : by == me ? "himself"
-                         : !DOES_ENTITY_EXIST(by) || !IS_ENTITY_A_PED(by) ? "an object" : IS_PED_HUMAN(by) ? "a person" : "an animal");
-                damaged_me_by_ = by;
-                damaged_me_t_ = s.time;
-            } else if (by == me && victim) {
-                hit_by_me_t_[victim] = s.time;
+            Hash type = GET_EVENT_AT_INDEX(0, i);
+            alignas(8) uint64_t d[36] = {};
+            auto slot = [&](int k) { return int(uint32_t(d[k])); };
+            auto life = [&](const char* what) { ev.push_back({WorldEvent::Life, 0, 1, what}); };
+            if (type == kDamaged) {
+                if (!GET_EVENT_DATA(0, i, d, 9)) continue;
+                const int victim = slot(0), by = slot(1);
+                if (victim == me) {
+                    if (log::debug_enabled() && s.time - damaged_me_t_ > 0.3)
+                        LOGD("damage event: Arthur hurt by %s", !by ? "nothing (fall, fire...)" : by == me ? "himself"
+                             : !DOES_ENTITY_EXIST(by) || !IS_ENTITY_A_PED(by) ? "an object" : IS_PED_HUMAN(by) ? "a person" : "an animal");
+                    damaged_me_by_ = by;
+                    damaged_me_t_ = s.time;
+                } else if (by == me && victim) {
+                    hit_by_me_t_[victim] = s.time;
+                }
+            } else if (type == kCalmPed) {
+                if (!GET_EVENT_DATA(0, i, d, 4) || slot(0) != me) continue;
+                LOGD("horse calmed (type %d, fully %d)", slot(2), slot(3));
+                ev.push_back({WorldEvent::Horse, 0, slot(2) >= 3 ? 1.0f : 0.7f, "calm"});
+            } else if (type == kPrompt) {
+                if (!GET_EVENT_DATA(0, i, d, 10) || (slot(0) != 49 && slot(0) != 50)) continue;
+                care_ = slot(0) == 49 ? "brush" : "feed";
+                care_start_ = s.time;
+                care_until_ = s.time + 25;
+                LOGD("horse care: %s", care_.c_str());
+            } else if (type == kCalcLoot) {
+                d[1] = 10;
+                d[12] = 10;
+                if (!GET_EVENT_DATA(0, i, d, 26) || slot(23) != me) continue;
+                int target_ent = slot(24);
+                if (target_ent && GET_IS_ANIMAL(target_ent)) {
+                    skin_until_ = s.time + 15;
+                    LOGD("skinning");
+                } else if (!target_ent && s.time - pluck_t_ > 1.8) {
+                    // Herb / plant composite loot has no animal/ped entity in slot 24
+                    pluck_t_ = s.time;
+                    life("pluck");
+                    LOGD("herb / plant looted (calc_loot)");
+                }
+            } else if (type == kLoot) {
+                d[1] = 10;
+                d[12] = 10;
+                if (GET_EVENT_DATA(0, i, d, 36) && slot(26) == me && slot(29) != 0 && s.time - pluck_t_ > 1.8) {
+                    pluck_t_ = s.time;
+                    life("pluck");
+                    LOGD("herb looted (event_loot herb=%08X)", unsigned(slot(29)));
+                }
+            } else if (type == kLootDone) {
+                if (GET_EVENT_DATA(0, i, d, 3) && slot(0) == me && s.time < skin_until_) {
+                    skin_until_ = 0;
+                }
+            } else if (type == kPickup) {
+                if (GET_EVENT_DATA(0, i, d, 4) && slot(0) == me) life("heave");
+            } else if (type == kStow) {
+                if (GET_EVENT_DATA(0, i, d, 6) && slot(0) == me) life("stow");
             }
         }
         for (auto it = hit_by_me_t_.begin(); it != hit_by_me_t_.end();)
             it = s.time - it->second > 1.0 ? hit_by_me_t_.erase(it) : std::next(it);
+        for (auto it = ped_shot_t_.begin(); it != ped_shot_t_.end();)
+            it = s.time - it->second > 5.0 ? ped_shot_t_.erase(it) : std::next(it);
     }
     std::map<int, int> seen;
     int attacker = 0;
     float attacker_dist = 1e9f;
-    int health = GET_ENTITY_HEALTH(me);
+    int health = hp;
     bool hurt = last_health_ >= 0 && health < last_health_;
     const bool damage_now = s.time - damaged_me_t_ < 0.3;   // the game reported damage to Arthur this moment
     if (hurt && damage_now && damaged_me_by_ && damaged_me_by_ != me && DOES_ENTITY_EXIST(damaged_me_by_) &&
@@ -1104,26 +1250,50 @@ void World::tick() {
         attacker = damaged_me_by_;
         attacker_dist = std::sqrt(dx * dx + dy * dy + dz * dz);
     }
+    const bool melee_weapon = !s.armed || s.group == kGroupUnarmed || s.group == kGroupMelee;
+    const bool want_speech = dialogue().speech_wanted();
+    talkers_.clear();
+    std::vector<Dialogue::Talker> close_by;
+    if (want_speech) talkers_.push_back({shv_getScriptHandleBaseAddress(me), me, 0.0f, 0.0f, true});
+    // Single pass over nearby peds for combat, melee hits/KOs, gunfire, nearby trains, and dialogue talkers
+    float best_train_d = 35.0f;
     for (int i = 0; i < n; ++i) {
         Ped p = peds[i];
         if (!p || p == me) continue;
         Vector3 q = GET_ENTITY_COORDS(p);
         float dx = q.x - pos.x, dy = q.y - pos.y, dz = q.z - pos.z;
-        float d = std::sqrt(dx * dx + dy * dy + dz * dz);
-        if (d > 90) continue;
+        float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 > 90.0f * 90.0f) continue;
+        float d = std::sqrt(d2);
+        if (want_speech && d <= 25.0f)
+            close_by.push_back({shv_getScriptHandleBaseAddress(p), p, pan_to(q.x, q.y, cam, pos.x, pos.y), d, false});
+        if (!s.in_train && d < best_train_d && IS_PED_IN_ANY_TRAIN(p)) {
+            float ts = GET_ENTITY_SPEED(p);
+            if (ts > 1.5f) {
+                best_train_d = d;
+                s.near_train_dist = d;
+                s.near_train_speed = ts;
+                s.near_train_pan = pan_to(q.x, q.y, cam, pos.x, pos.y);
+            }
+        }
         if (p == melee_target && d < 2.6f) s.melee_target_near = true;
-        if (IS_PED_SHOOTING(p) && d < 75 && s.time - ped_shot_t_[p] > 0.08) {
+        if (d < 75.0f && IS_PED_SHOOTING(p) && s.time - ped_shot_t_[p] > 0.08) {
             ped_shot_t_[p] = s.time;
             ev.push_back({WorldEvent::Gunfire, pan_to(q.x, q.y, cam, pos.x, pos.y), 1.0f / (1.0f + d / 12.0f), ""});
         }
-        if (d < 45) {
+        if (d < 45.0f) {
             int h = GET_ENTITY_HEALTH(p);
             seen[p] = h;
             auto it = ped_health_.find(p);
             auto hit = hit_by_me_t_.find(p);
             if (it != ped_health_.end() && h < it->second && hit != hit_by_me_t_.end() && s.time - hit->second < 0.3) {
-                if (d < 3.0f) ++melee_hits_;
-                else ev.push_back({WorldEvent::HitConfirm, 0.5f, 1.0f, ""});
+                hit_by_me_t_.erase(hit);
+                if (d < 3.0f && melee_weapon) {
+                    ++melee_hits_;
+                    if (h <= 0 || IS_PED_DEAD_OR_DYING(p)) ++melee_ko_;
+                } else {
+                    ev.push_back({WorldEvent::HitConfirm, pan_to(q.x, q.y, cam, pos.x, pos.y), 1.0f, ""});
+                }
             }
         }
     }
@@ -1132,34 +1302,19 @@ void World::tick() {
         speech_probe(me, peds, n, pos.x, pos.y, pos.z, cam, s.time);
         scene_probe(me, s.time);
     }
-    // speech vibration: who near is talking (their game objects; the dialogue module reads which line)
-    talkers_.clear();
-    if (dialogue().speech_wanted()) {
-        // everyone within 25 m (nearest 16): the game's "is speaking" natives miss some conversation lines, the
-        // speech requests in memory do not
-        talkers_.push_back({shv_getScriptHandleBaseAddress(me), me, 0.0f, 0.0f, true});
-        std::vector<Dialogue::Talker> close_by;
-        for (int i = 0; i < n; ++i) {
-            int p = peds[i];
-            if (!p || p == me) continue;
-            shv::Vector3 q = GET_ENTITY_COORDS(p);
-            float dx = q.x - pos.x, dy = q.y - pos.y, dz = q.z - pos.z;
-            float d = std::sqrt(dx * dx + dy * dy + dz * dz);
-            if (d > 25) continue;
-            close_by.push_back({shv_getScriptHandleBaseAddress(p), p, pan_to(q.x, q.y, cam, pos.x, pos.y), d, false});
-        }
+    if (want_speech && !close_by.empty()) {
         std::sort(close_by.begin(), close_by.end(), [](const auto& a, const auto& b) { return a.dist < b.dist; });
         if (close_by.size() > 16) close_by.resize(16);
         talkers_.insert(talkers_.end(), close_by.begin(), close_by.end());
     }
-    dialogue().game_tick(talkers_, talkers_.empty() ? 0 : GET_LAST_PLAYED_SPEECH_FOR_PED(me));
+    dialogue().game_tick(talkers_, talkers_.empty() ? 0 : GET_LAST_PLAYED_SPEECH_FOR_PED(me), s.halted, s.cutscene);
     greet(pl, me, pos.x, pos.y, peds, n, s, ev);
     s.melee_hits = melee_hits_;
-    // a hit only when something really hit: an attacker, a fall, or a real chunk of health. Small drops with
-    // nobody around are the health ring draining (a fortified ring wearing off, an empty core) - not hits.
-    if (hurt && !attacker && !IS_PED_FALLING(me) && !IS_PED_RAGDOLL(me)) {
-        int max_hp = GET_ENTITY_MAX_HEALTH(me);
-        if (last_health_ - health < std::max(1, max_hp * 2 / 100)) {
+    s.melee_ko = melee_ko_;
+    // a hit only when something really hit: an attacker, a game damage event (fire/poison/drowning), a fall, or a
+    // real chunk of health. Small passive drops without EVENT_ENTITY_DAMAGED are core/tonic drain - not hits.
+    if (hurt && !attacker && !damage_now && !IS_PED_FALLING(me) && !IS_PED_RAGDOLL(me)) {
+        if (last_health_ - health < std::max(1, hp_max * 2 / 100)) {
             LOGD("health %d -> %d: drain, not a hit", last_health_, health);
             hurt = false;
         }
@@ -1180,53 +1335,6 @@ void World::tick() {
     }
     last_health_ = health;
 
-    // --- the game's events (8-byte slots; sizes must match exactly) ---
-    {
-        static const Hash kCalmPed = 0x89AB08C3;      // calmer, mount, calm type, fully calmed
-        static const Hash kPrompt = 0x52AE9189;       // EVENT_PLAYER_PROMPT_TRIGGERED: [0] prompt type (49 brush, 50 feed)
-        static const Hash kCalcLoot = 0x834F764A;     // EVENT_CALCULATE_LOOT: [23] looter, [24] looted entity
-        static const Hash kLoot = 0xA5E4EAF7;         // EVENT_LOOT: [26] looter, [29] herb (non-zero = a plant)
-        static const Hash kLootDone = 0x52063E5B;     // EVENT_LOOT_COMPLETE: [0] looter, [1] entity, [2] success
-        static const Hash kPickup = 0xD7092502;       // EVENT_PICKUP_CARRIABLE: [0] carrier, [2] taken from a horse
-        static const Hash kStow = 0x4086BF1A;         // EVENT_PLACE_CARRIABLE_ONTO_PARENT: [0] player, [2] horse
-        int n_ev = GET_NUMBER_OF_EVENTS(0);
-        for (int i = 0; i < n_ev; ++i) {
-            Hash type = GET_EVENT_AT_INDEX(0, i);
-            alignas(8) uint64_t d[36] = {};
-            auto slot = [&](int k) { return int(uint32_t(d[k])); };
-            auto life = [&](const char* what) { ev.push_back({WorldEvent::Life, 0, 1, what}); };
-            if (type == kCalmPed) {
-                if (!GET_EVENT_DATA(0, i, d, 4) || slot(0) != me) continue;
-                LOGD("horse calmed (type %d, fully %d)", slot(2), slot(3));
-                ev.push_back({WorldEvent::Horse, 0, slot(2) >= 3 ? 1.0f : 0.7f, "calm"});
-            } else if (type == kPrompt) {
-                if (!GET_EVENT_DATA(0, i, d, 10) || (slot(0) != 49 && slot(0) != 50)) continue;
-                care_ = slot(0) == 49 ? "brush" : "feed";
-                care_start_ = s.time;
-                care_until_ = s.time + 25;
-                LOGD("horse care: %s", care_.c_str());
-            } else if (type == kCalcLoot) {
-                d[1] = 10;                                 // the two reward arrays' lengths, as Rockstar's scripts set them
-                d[12] = 10;
-                if (!GET_EVENT_DATA(0, i, d, 26) || slot(23) != me) continue;
-                if (GET_IS_ANIMAL(slot(24))) {
-                    skin_until_ = s.time + 15;
-                    LOGD("skinning");
-                }
-            } else if (type == kLoot) {
-                d[1] = 10;
-                d[12] = 10;
-                if (GET_EVENT_DATA(0, i, d, 36) && slot(26) == me && slot(29) != 0) life("pluck");
-            } else if (type == kLootDone) {
-                if (GET_EVENT_DATA(0, i, d, 3) && slot(0) == me) skin_until_ = 0;
-            } else if (type == kPickup) {
-                if (GET_EVENT_DATA(0, i, d, 4) && slot(0) == me) life("heave");
-            } else if (type == kStow) {
-                if (GET_EVENT_DATA(0, i, d, 6) && slot(0) == me) life("stow");
-            }
-        }
-    }
-
     // --- camp life: what Arthur has in his hands, and what he is doing ---
     if (s.time - life_poll_t_ > 0.5) {
         life_poll_t_ = s.time;
@@ -1241,7 +1349,11 @@ void World::tick() {
         std::string kind = item_kind(item);
         if (kind.empty() && item) kind = smoking_ ? "smoke" : drinking_ ? "drink" : eating_ ? "eat" : "";
         if (item != last_item_) {
-            if (item) LOGD("item in hand: state 0x%08X (%s)", item, kind.empty() ? "?" : kind.c_str());
+            if (item) {
+                LOGD("item in hand: state 0x%08X (%s)", item, kind.empty() ? "?" : kind.c_str());
+                if (!s.halted && !s.blocked && !last_item_ && !s.armed && !s.on_mount && !s.in_vehicle)
+                    ev.push_back({WorldEvent::Life, 0.2f, 0.65f, "pickup"});
+            }
             last_item_ = item;
         }
         // each bite, sip or puff: the moment the game applies the item's effect
@@ -1489,7 +1601,7 @@ void World::tick() {
     // --- gyro aim: turn the camera by what the controller turned ---
     float yaw = atomic_take(gyro_yaw_), pitch = atomic_take(gyro_pitch_);
     // only while the right stick rests: setting the camera every frame would override the stick
-    if (gyro_enabled && !s.blocked && ((s.free_aim && !s.lock_on) || gyro_wants_always) && !gyro_stick_busy &&
+    if (gyro_enabled && !s.blocked && ((s.armed && s.free_aim && !s.lock_on) || gyro_wants_always) && !gyro_stick_busy &&
         (std::fabs(yaw) > 1e-4f || std::fabs(pitch) > 1e-4f)) {
         SET_GAMEPLAY_CAM_RELATIVE_HEADING(GET_GAMEPLAY_CAM_RELATIVE_HEADING() + yaw);
         SET_GAMEPLAY_CAM_RELATIVE_PITCH(GET_GAMEPLAY_CAM_RELATIVE_PITCH() + pitch);

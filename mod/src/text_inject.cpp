@@ -14,6 +14,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -55,6 +56,7 @@ std::vector<Region> regions(uintptr_t skip) {
         if (m.State == MEM_COMMIT && m.Type == MEM_PRIVATE && (m.Protect & PAGE_READWRITE) &&
             !(m.Protect & PAGE_GUARD) && base != skip)
             out.push_back({base, m.RegionSize});
+        if (m.RegionSize == 0) break;
         a = base + m.RegionSize;
     }
     return out;
@@ -175,7 +177,9 @@ bool locate_slow(Table& out) {
     for (int i = 0; i < kProbeCount; ++i) {
         for (uintptr_t e : holders[i]) {
             for (uint32_t c = 16; c < kMaxBuckets; ++c) {
-                uintptr_t b = e - 8ull * (keys[i] % c);
+                uint64_t off_bytes = 8ull * (keys[i] % c);
+                if (e < off_bytes) continue;
+                uintptr_t b = e - off_bytes;
                 int agree = 0;
                 for (int j = 0; j < kProbeCount; ++j) {
                     if (j == i) continue;
@@ -224,22 +228,31 @@ uintptr_t inject(const Table& t) {
         auto* node = reinterpret_cast<Node*>(p);
         p += 32;
         uint32_t key = joaat(x.key);
-        auto* slot = reinterpret_cast<volatile uint64_t*>(t.buckets + 8ull * (key % t.count));
+        auto* slot = reinterpret_cast<volatile LONG64*>(t.buckets + 8ull * (key % t.count));
         node->hash = key;
         node->value = reinterpret_cast<uint64_t>(value);
-        node->next = *slot;
-        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(slot), LONG64(reinterpret_cast<uint64_t>(node)));
+        LONG64 node_ptr = LONG64(reinterpret_cast<uint64_t>(node));
+        for (;;) {
+            LONG64 head = *slot;
+            node->next = uint64_t(head);
+            if (InterlockedCompareExchange64(slot, node_ptr, head) == head) break;
+        }
         if (!first) first = reinterpret_cast<uintptr_t>(node);
     }
     return first;
 }
 
+std::atomic<bool> g_stop{false};
+std::thread g_thread;
+
 void run() {
     Table table;
     uintptr_t ours = 0;                           // our first node
     int misses = 0;
-    for (;;) {
-        std::this_thread::sleep_for(std::chrono::seconds(ours ? 5 : 2));
+    while (!g_stop.load()) {
+        for (int s = 0; s < (ours ? 50 : 20) && !g_stop.load(); ++s)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (g_stop.load()) break;
         if (ours && find_in(table, joaat(kTexts[0].key)) == ours) continue;     // still linked
         if (ours) LOGI("texts: the game reloaded its string table - adding ours again");
         ours = 0;
@@ -248,14 +261,21 @@ void run() {
         if (!found) continue;
         misses = 0;
         ours = inject(table);
-        LOGI("texts: %zu texts added", sizeof kTexts / sizeof kTexts[0]);
+        if (ours) LOGI("texts: %zu texts added", sizeof kTexts / sizeof kTexts[0]);
     }
 }
 
 }  // namespace
 
 void text_inject_start() {
-    std::thread(run).detach();
+    if (g_thread.joinable()) return;
+    g_stop = false;
+    g_thread = std::thread(run);
+}
+
+void text_inject_stop() {
+    g_stop = true;
+    if (g_thread.joinable()) g_thread.join();
 }
 
 }  // namespace dsr2

@@ -42,7 +42,7 @@ static std::map<std::string, std::vector<std::string>> game_banks() {
 }
 
 void GameAudio::discover(const fs::path& game_dir, const fs::path& labels_json) {
-    std::lock_guard<std::mutex> l(mu_);
+    std::lock_guard<std::recursive_mutex> l(mu_);
     paths_.clear();
     game_paths_.clear();
     std::error_code ec;
@@ -80,12 +80,14 @@ void GameAudio::discover(const fs::path& game_dir, const fs::path& labels_json) 
 }
 
 std::vector<std::string> GameAudio::game_files() const {
+    std::lock_guard<std::recursive_mutex> l(mu_);
     std::vector<std::string> out;
     for (auto& [bank, where] : game_paths_) out.insert(out.end(), where.begin(), where.end());
     return out;
 }
 
 size_t GameAudio::bank_count(bool weapons_only) const {
+    std::lock_guard<std::recursive_mutex> l(mu_);
     if (!weapons_only) return paths_.size() + game_paths_.size();
     size_t n = 0;
     for (auto& [b, _] : paths_) n += is_weapon_bank(b);
@@ -94,7 +96,7 @@ size_t GameAudio::bank_count(bool weapons_only) const {
 }
 
 const std::vector<GameSound>& GameAudio::sounds(const std::string& bank) {
-    std::lock_guard<std::mutex> l(mu_);
+    std::lock_guard<std::recursive_mutex> l(mu_);
     auto it = cache_.find(bank);
     if (it != cache_.end()) return it->second;
     std::vector<GameSound> loaded = load(bank);
@@ -104,6 +106,7 @@ const std::vector<GameSound>& GameAudio::sounds(const std::string& bank) {
 }
 
 std::string GameAudio::role(const GameSound& s) const {
+    std::lock_guard<std::recursive_mutex> l(mu_);
     auto it = labels_.find(s.bank + "/" + s.key);
     if (it != labels_.end()) return it->second;
     for (uint32_t id : s.ids) {                 // a label may name any of the sound's streams
@@ -135,8 +138,15 @@ std::vector<GameSound> GameAudio::load(const std::string& bank) {
     std::vector<uint8_t> d;
     auto pit = paths_.find(bank);
     if (pit != paths_.end()) {
-        std::ifstream f(pit->second, std::ios::binary);
-        d.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        std::ifstream f(pit->second, std::ios::binary | std::ios::ate);
+        if (f) {
+            std::streamsize sz = f.tellg();
+            if (sz > 0) {
+                d.resize(size_t(sz));
+                f.seekg(0, std::ios::beg);
+                if (!f.read(reinterpret_cast<char*>(d.data()), sz)) d.clear();
+            }
+        }
     } else {
         auto git = game_paths_.find(bank);
         if (git == game_paths_.end()) return out;
@@ -157,15 +167,25 @@ std::vector<GameSound> GameAudio::load(const std::string& bank) {
     }
     uint16_t flags = u16(6);
     uint32_t count = u32(8);
-    size_t off = 16 + ((flags & 1) ? 2 * count : 0);
+    if (count == 0 || count > 100000) {
+        LOGW("%s: invalid AWC stream count %u", bank.c_str(), count);
+        return out;
+    }
+    size_t off = 16 + ((flags & 1) ? 2 * size_t(count) : 0);
+    if (off + 4 * size_t(count) > d.size()) {
+        LOGW("%s: truncated AWC header", bank.c_str());
+        return out;
+    }
     std::vector<uint32_t> infos(count);
-    for (uint32_t i = 0; i < count; ++i) infos[i] = u32(off + 4 * i);
-    off += 4 * count;
+    for (uint32_t i = 0; i < count; ++i) infos[i] = u32(off + 4 * size_t(i));
+    off += 4 * size_t(count);
     std::vector<RawStream> streams;
     for (uint32_t info : infos) {
         size_t fmt_size = 0, fmt_off = 0, data_size = 0, data_off = 0;
         bool has_fmt = false, has_data = false;
-        for (uint32_t c = 0; c < (info >> 29); ++c) {
+        uint32_t nchunks = info >> 29;
+        if (off + 8 * size_t(nchunks) > d.size()) break;
+        for (uint32_t c = 0; c < nchunks; ++c) {
             uint64_t v = uint64_t(u32(off)) | (uint64_t(u32(off + 4)) << 32);
             off += 8;
             uint32_t type = uint32_t(v >> 56);
@@ -177,7 +197,7 @@ std::vector<GameSound> GameAudio::load(const std::string& bank) {
         if (!has_fmt || !has_data || fmt_off + 10 > d.size()) continue;
         uint32_t samples = u32(fmt_off);
         int rate = u16(fmt_off + 8);
-        if (data_size != size_t(samples) * 2 || data_off + data_size > d.size() || !samples) continue;  // PCM16 only
+        if (rate <= 0 || data_size != size_t(samples) * 2 || data_off + data_size > d.size() || !samples) continue;  // PCM16 only
         streams.push_back({info & 0x1FFFFFFF, rate, reinterpret_cast<const int16_t*>(d.data() + data_off), samples});
     }
     // de-duplicate identical recordings in several slots

@@ -23,10 +23,19 @@ void Features::configure() {
     minigame_gain_ = c.num("Haptics", "TableGames", 0.7f);
     weather_gain_ = c.num("Haptics", "Weather", 0.3f);
     life_gain_ = c.num("Haptics", "CampLife", 0.6f);
+    confirm_gain_ = c.num("Mic", "Confirm", 1.0f);
     riding_pulse_ = c.integer("Triggers", "RidingPulse", 0);
+    bool was_lb = lightbar_on_;
     lightbar_on_ = c.flag("Lightbar", "Enabled", true);
+    if (was_lb && !lightbar_on_) lightbar_off_sent_ = false;
     brightness_ = c.num("Lightbar", "Brightness", 1.0f);
     ammo_leds_ = c.flag("Lightbar", "AmmoLeds", true);
+    std::string lm = c.str("Lightbar", "PlayerLeds", "auto");
+    for (char& ch : lm) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    if (!ammo_leds_ || lm == "off" || lm == "0") led_mode_ = LedMode::Off;
+    else if (lm == "health") led_mode_ = LedMode::Health;
+    else if (lm == "ammo") led_mode_ = LedMode::Ammo;
+    else led_mode_ = LedMode::Auto;
     time_of_day_ = c.flag("Lightbar", "TimeOfDay", true);
 }
 
@@ -40,17 +49,13 @@ static Cue make(const std::string& name, float gain, float pan = 0, bool has_pan
     return c;
 }
 
-// A real step / hoof that is in water also pushes through it (deeper and faster = heavier); one in bushes brushes
-// through them (the game's own foliage state). Both ride on the real steps: nothing is felt between them.
-void Features::through(float wade, bool foliage, float foliage_h, float speed, float gain, float pan,
-                       std::vector<Cue>& cues) {
+// A real step / hoof that is in water also pushes through it (deeper and faster = heavier).
+void Features::through(float wade, float speed, float gain, float pan, std::vector<Cue>& cues) {
     if (wade > 0.06f) {
         float depth = clampv((wade - 0.06f) / 0.35f, 0.2f, 1.0f);
         float pace = clampv(0.55f + speed / 8.0f, 0.55f, 1.1f);
         cues.push_back(make("wade_push", gain * 1.4f * depth * pace * rng_.range(0.85f, 1.1f), pan, true));
     }
-    (void)foliage;
-    (void)foliage_h;                     // bushes: rustle() - for as long as you move through them, not only on steps
 }
 
 // Bushes (the game's own "pushing through foliage" state): a swish going in, then a rustle for as long as you keep
@@ -82,7 +87,6 @@ void Features::splash(float wade, float& was, float speed, float gain, std::vect
 
 void Features::horse(const GameSnapshot& g, double now, std::vector<Cue>& cues, OutputState& out, bool weapon_active) {
     if (!g.on_mount) {
-        mount_t_ = now;
         rearing_ = false;
         return;
     }
@@ -112,7 +116,7 @@ void Features::horse(const GameSnapshot& g, double now, std::vector<Cue>& cues, 
     if (rear && !rearing_) cues.push_back(make("horse_rear", horse_gain_ * 1.2f));
     rearing_ = rear;
     // the triggers feel the gait while riding unarmed
-    if (!weapon_active && riding_pulse_ > 0 && stride_hz > 0.8f && !g.aiming) {
+    if (triggers_on_ && !weapon_active && riding_pulse_ > 0 && stride_hz > 0.8f && !g.aiming) {
         int hz = clampv(int(std::lround(stride_hz * float(beats) / 2)), 1, 8);
         out.r2 = fx::galloping(3, 9, 4, 7, hz);
         out.l2 = fx::galloping(3, 9, 4, 7, hz);
@@ -133,16 +137,34 @@ void Features::transport(const GameSnapshot& g, double now, std::vector<Cue>& cu
             // the rear bogie crosses the same joint ~10 m later
             delayed_.push_back({now + 10.0 / std::max(2.0f, g.speed), make("rail_clack", gain * 0.8f)});
         }
-    } else if (g.in_vehicle && !g.in_train && g.speed > 1.5f) {
+    } else if (g.in_vehicle && !g.in_train && !g.in_boat && g.speed > 1.5f) {
         if (now >= next_rut_) {
             next_rut_ = now + rng_.range(0.4f, 2.5f) / clampv(g.speed / 5.0f, 0.5f, 3.0f);
             cues.push_back(make("wagon_rut", train_gain_ * rng_.range(0.4f, 1.0f), rng_.range(-0.5f, 0.5f), true));
         }
+    } else if (!g.in_train && g.near_train_dist >= 0 && g.near_train_dist < 35.0f && g.near_train_speed > 1.5f) {
+        // standing near moving rail-cars / tracks: directional ground rumble + rail-joint clacks
+        if (now >= next_near_train_) {
+            float prox = 1.0f / (1.0f + g.near_train_dist / 8.0f);
+            float spd = clampv(g.near_train_speed / 14.0f, 0.35f, 1.0f);
+            float gain = train_gain_ * prox * spd;
+            cues.push_back(make("train_pass", gain, g.near_train_pan, true));
+            if (g.near_train_dist < 18.0f)
+                cues.push_back(make("rail_clack", gain * 0.65f, g.near_train_pan, true));
+            next_near_train_ = now + clampv(0.55f / std::max(0.5f, spd), 0.28f, 0.75f);
+        }
     }
 }
 
-void Features::lightbar(const GameSnapshot& g, const EngineFrame* w, double now, OutputState& out) {
-    if (!lightbar_on_) return;
+void Features::lightbar(const InputState& in, const GameSnapshot& g, const EngineFrame* w, double now, OutputState& out) {
+    if (!lightbar_on_) {
+        lb_[0] = lb_[1] = lb_[2] = 0;
+        out.has_lightbar = true;
+        out.r = out.g = out.b = 0;
+        lightbar_off_sent_ = true;
+        return;
+    }
+    lightbar_off_sent_ = false;
     float r = 0, gr = 0, b = 0;
     float t = float(now);
     if (now < damage_flash_until_) {
@@ -159,21 +181,34 @@ void Features::lightbar(const GameSnapshot& g, const EngineFrame* w, double now,
     } else if (g.lantern) {
         float fl = 0.75f + 0.15f * std::sin(t * 13.0f) + 0.1f * std::sin(t * 31.0f + 1.3f);
         r = 255 * fl; gr = 140 * fl; b = 40 * fl;                   // warm flicker
-    } else if (g.wanted) {
-        bool red = std::fmod(t, 1.0f) < 0.5f;
-        r = red ? 200.0f : 120.0f; gr = red ? 0.0f : 120.0f; b = red ? 0.0f : 140.0f;
+    } else if (g.wanted && !g.halted) {
+        // police / lawman alternating flash, speeding up as wanted score rises
+        float wlvl = clampv(float(g.wanted_score) / 600.0f, 0.0f, 1.0f);
+        double period = 0.85 - 0.45 * double(wlvl);
+        bool red = std::fmod(now, period) < period * 0.5;
+        r = red ? 220.0f : 30.0f; gr = 0.0f; b = red ? 0.0f : 220.0f;
     } else if (g.health_core < 25) {
-        float beat = std::fmod(t, 0.9f) < 0.15f ? 1.0f : 0.25f;
+        float beat = std::fmod(now, 0.9) < 0.15 ? 1.0f : 0.25f;
         r = 180 * beat;
+    } else if (!in.charging() && in.battery == 0 && std::fmod(now, 4.0) < 0.25) {
+        r = 160; gr = 35; b = 0;                                    // gentle low-battery blink when discharging
     } else if (time_of_day_) {
-        int h = g.hour;
-        if (h >= 21 || h < 5) { r = 5; gr = 10; b = 40; }               // night
-        else if (h < 7) { r = 120; gr = 60; b = 30; }                   // dawn
-        else if (h < 18) { r = 70; gr = 55; b = 35; }                   // day: warm, dim
-        else { r = 150; gr = 60; b = 15; }                              // sunset
+        // Smooth blend across night (5), dawn (6), day (8..17), sunset (19), night (21)
+        auto lerp3 = [&](float a0, float a1, float a2, float b0, float b1, float b2, float u) {
+            r = a0 + (b0 - a0) * u; gr = a1 + (b1 - a1) * u; b = a2 + (b2 - a2) * u;
+        };
+        float h = float(g.hour);
+        if (h < 5.0f || h >= 21.0f) { r = 5; gr = 10; b = 40; }
+        else if (h < 6.0f) lerp3(5, 10, 40, 120, 60, 30, h - 5.0f);
+        else if (h < 8.0f) lerp3(120, 60, 30, 70, 55, 35, (h - 6.0f) * 0.5f);
+        else if (h < 18.0f) { r = 70; gr = 55; b = 35; }
+        else if (h < 19.0f) lerp3(70, 55, 35, 150, 60, 15, h - 18.0f);
+        else lerp3(150, 60, 15, 5, 10, 40, (h - 19.0f) * 0.5f);
     }
-    // smooth (except flashes)
-    float k = (now < damage_flash_until_ || (w && w->flash)) ? 1.0f : 0.15f;
+    // dt-independent smoothing (except instant flashes)
+    double dt = last_lb_t_ > 0 ? clampv(now - last_lb_t_, 0.0, 0.2) : 0.016;
+    last_lb_t_ = now;
+    float k = (now < damage_flash_until_ || (w && w->flash)) ? 1.0f : (1.0f - std::exp(-float(dt) / 0.04f));
     lb_[0] += (r - lb_[0]) * k;
     lb_[1] += (gr - lb_[1]) * k;
     lb_[2] += (b - lb_[2]) * k;
@@ -187,24 +222,60 @@ void Features::update(const InputState& in, const GameSnapshot& g, std::vector<W
                       bool weapon_active, int clip, int clip_size, bool mic_listening, OutputState& out, std::vector<Cue>& cues) {
     double now = in.t;
     out.mute_led = mic_listening ? 0 : 1;
-    for (auto it = delayed_.begin(); it != delayed_.end();) {
-        if (it->first <= now) { cues.push_back(it->second); it = delayed_.erase(it); }
-        else ++it;
+    if (!g.valid || g.halted) {
+        delayed_.clear();
+    } else {
+        for (auto it = delayed_.begin(); it != delayed_.end();) {
+            if (it->first <= now) { cues.push_back(it->second); it = delayed_.erase(it); }
+            else ++it;
+        }
     }
-    if (ammo_leds_) {
-        if (weapon_active && clip_size > 0 && clip >= 0) {
+    if (g.valid) {
+        if (prev_health_core_ < 0) {
+            prev_health_core_ = g.health_core;
+        } else if (std::abs(g.health_core - prev_health_core_) >= 2 || (g.health_core == 0 && prev_health_core_ != 0)) {
+            prev_health_core_ = g.health_core;
+            health_led_until_ = now + 3.5;
+        }
+    }
+    if (led_mode_ == LedMode::Off) {
+        out.player_leds = 0;
+    } else {
+        static const int masks[6] = {0x00, 0x04, 0x0A, 0x15, 0x1B, 0x1F};   // centre-out like the PS5 player LEDs
+        const bool ammo_shown = led_mode_ != LedMode::Health && weapon_active && clip_size > 0 && clip >= 0;
+        const bool show_health = g.valid && now < health_led_until_ &&
+                                 (led_mode_ == LedMode::Health || (led_mode_ == LedMode::Auto && !ammo_shown));
+        if (g.valid && g.wanted && !g.halted) {
+            // police-light sweep on the 5 LEDs below the touchpad, faster at higher wanted levels
+            float wlvl = clampv(float(g.wanted_score) / 600.0f, 0.0f, 1.0f);
+            double period = 0.70 - 0.40 * double(wlvl);
+            bool left = std::fmod(now, period) < period * 0.5;
+            out.player_leds = left ? 0x03 : 0x18;                            // left 2 LEDs <-> right 2 LEDs
+        } else if (ammo_shown) {
             int lit = clip == 0 ? 0 : clampv(int(std::ceil(5.0f * clip / clip_size)), 1, 5);
-            static const int masks[6] = {0x00, 0x04, 0x0A, 0x15, 0x1B, 0x1F};   // centre-out like the PS5 player LEDs
+            out.player_leds = masks[lit];
+        } else if (show_health) {
+            // health indicator: 5 LEDs appear for 3.5 s whenever Arthur's health changes
+            int lit = g.health_core <= 0 ? 0 : clampv(int(std::ceil(5.0f * g.health_core / 100.0f)), 1, 5);
             out.player_leds = masks[lit];
         } else {
             out.player_leds = 0;
         }
     }
-    if (!g.valid) {          // standalone test: weapon state colours only
-        lightbar(g, weapon, now, out);
+    if (!g.valid) {          // standalone test: reset world state + weapon state colours only
+        prev_health_core_ = -1;
+        health_led_until_ = -10.0;
+        weapon_seen_ = false;
+        wade_was_ = 0;
+        horse_wade_was_ = 0;
+        foliage_was_ = false;
+        horse_foliage_was_ = false;
+        rearing_ = false;
+        delayed_.clear();
+        lightbar(in, g, weapon, now, out);
         return;
     }
-    for (auto& e : events) {
+    if (!g.halted) for (auto& e : events) {
         if (e.type == WorldEvent::Damage && damage_gain_ > 0) {
             std::string name = e.cause == "melee" ? "hit_melee" : e.cause == "animal" ? "hit_animal"
                              : e.cause == "fall" ? "hit_fall" : "hit_bullet";
@@ -241,24 +312,22 @@ void Features::update(const InputState& in, const GameSnapshot& g, std::vector<W
                                     e.pan, true));
             }
         } else if (e.type == WorldEvent::HitConfirm && hit_gain_ > 0) {
-            cues.push_back(make("hit_confirm", hit_gain_, 0.6f, true));
+            cues.push_back(make("hit_confirm", hit_gain_, e.pan, true));
         } else if (e.type == WorldEvent::Footstep && step_gain_ > 0) {
-            // boots: left foot on the left actuator, right on the right; the ground decides the character, the pace
-            // the weight - a sprint lands heavier and longer than a stroll, not just louder
+            // boots: left foot on the left actuator, right on the right; carrying a body makes each step heavier & deeper
             Cue c = make("step_" + e.cause, step_gain_ * e.strength * rng_.range(0.9f, 1.08f), e.pan, true);
-            c.speed = g.speed < 2.2f ? 1.06f : g.speed < 4.8f ? 0.97f : 0.9f;
+            c.speed = (g.speed < 2.2f ? 1.06f : g.speed < 4.8f ? 0.97f : 0.9f) * (g.carrying ? 0.88f : 1.0f);
             cues.push_back(c);
-            through(g.wade, g.foliage, g.foliage_height, g.speed, step_gain_, e.pan, cues);
+            through(g.wade, g.speed, step_gain_, e.pan, cues);
         } else if (e.type == WorldEvent::Hoof && horse_gain_ > 0) {
-            last_hoof_event_ = now;
             Cue c = make("hoof_" + e.cause, horse_gain_ * e.strength * rng_.range(0.88f, 1.08f), e.pan, true);
             float v = g.mount_speed;
             c.speed = v < 2.3f ? 1.06f : 1.0f;       // a walk crisper; faster gaits carry their energy in more hoofbeats
             cues.push_back(c);
-            through(g.horse_wade, g.horse_foliage, g.horse_foliage_height, v, horse_gain_ * 0.8f, e.pan, cues);
+            through(g.horse_wade, v, horse_gain_ * 0.8f, e.pan, cues);
         } else if (e.type == WorldEvent::Land && land_gain_ > 0) {
             cues.push_back(make("land", land_gain_ * e.strength));
-            cues.push_back(make("step_" + e.cause, step_gain_ * 1.2f));
+            if (step_gain_ > 0) cues.push_back(make("step_" + e.cause, step_gain_ * 1.2f));
         } else if (e.type == WorldEvent::Climb && action_gain_ > 0) {
             cues.push_back(make("climb_grab", action_gain_));
         } else if (e.type == WorldEvent::Minigame && minigame_gain_ > 0) {
@@ -274,29 +343,64 @@ void Features::update(const InputState& in, const GameSnapshot& g, std::vector<W
         } else if (e.type == WorldEvent::Life && life_gain_ > 0) {
             static const std::map<std::string, std::string> kCue = {
                 {"bite", "bite"}, {"gulp", "gulp"}, {"puff", "puff"}, {"brush", "brush_stroke"}, {"feed", "horse_feed"},
-                {"stow", "stow"}, {"heave", "heave"}, {"pluck", "pluck"}};
+                {"stow", "stow"}, {"heave", "heave"}, {"pluck", "pluck"}, {"pickup", "craft_tap"},
+                {"wagon_mount", "wagon_mount"}, {"wagon_dismount", "land"}};
             auto it = kCue.find(e.cause);
-            if (it != kCue.end()) cues.push_back(make(it->second, life_gain_ * e.strength));
-        } else if (e.type == WorldEvent::Horse) {
-            float g = config().num("Mic", "Confirm", 1.0f);
-            const char* cue = e.cause == "rein" ? "rein_pull" : e.cause == "spur" ? "spur" : "horse_pat";
-            cues.push_back(make(cue, g * e.strength));
+            if (it != kCue.end()) {
+                bool heavy = (e.cause == "wagon_mount" || e.cause == "pluck");
+                float mult = e.cause == "pluck" ? 1.35f : e.cause == "wagon_mount" ? 1.25f : 1.0f;
+                cues.push_back(make(it->second, life_gain_ * mult * e.strength, e.pan, e.pan != 0, heavy));
+            }
+        } else if (e.type == WorldEvent::Horse && (confirm_gain_ > 0 || horse_gain_ > 0)) {
+            const float hgain = (e.cause == "mount" || e.cause == "dismount")
+                                    ? std::max(horse_gain_ * 1.4f, action_gain_ * 1.2f)
+                                    : confirm_gain_;
+            const char* cue = e.cause == "rein" ? "rein_pull" : e.cause == "spur" ? "spur"
+                            : e.cause == "mount" ? "horse_mount" : e.cause == "dismount" ? "land" : "horse_pat";
+            if (hgain > 0) cues.push_back(make(cue, hgain * e.strength, 0.0f, false, e.cause == "mount"));
         } else if (e.type == WorldEvent::Honor) {
             honor_up_ = e.cause == "up";
             honor_until_ = now + 1.4;
             cues.push_back(make(honor_up_ ? "honor_up" : "honor_down", e.strength));
-        } else if (e.type == WorldEvent::Ack) {
-            float g = config().num("Mic", "Confirm", 1.0f);
-            cues.push_back(make(e.cause == "speech" ? "hit_confirm" : "whistle_ack", e.cause == "speech" ? g * 2.5f : g));
+        } else if (e.type == WorldEvent::Ack && confirm_gain_ > 0) {
+            cues.push_back(make(e.cause == "speech" ? "hit_confirm" : "whistle_ack",
+                                e.cause == "speech" ? confirm_gain_ * 2.5f : confirm_gain_));
         } else if (e.type == WorldEvent::Door && action_gain_ > 0) {
             cues.push_back(make("door_open", action_gain_, e.pan, true));
         }
     }
-    if (!g.blocked && weather_gain_ > 0 && !g.indoors) {             // rain on the hat, as heavy as the game's rain
-        // single drops you can count, not a buzz: ~2/s in a drizzle, ~4/s in rain, ~9/s in a downpour (was up to ~33/s)
-        if (g.rain > 0.05f && now >= next_drop_) {
-            next_drop_ = now + rng_.range(0.5f, 1.5f) / (1.5f + 8.0f * g.rain);
-            cues.push_back(make("rain_drop", weather_gain_ * rng_.range(0.3f, 1.0f), rng_.range(-0.8f, 0.8f), true));
+    if (!g.blocked && weather_gain_ > 0 && !g.indoors) {             // rain, hail, storm wind gusts & distant thunder
+        static const uint32_t kHail = joaat("HAIL"), kSleet = joaat("SLEET"), kThunder = joaat("THUNDER"),
+                              kThunderstorm = joaat("THUNDERSTORM"), kHurricane = joaat("HURRICANE"),
+                              kBlizzard = joaat("BLIZZARD"), kGroundBlizzard = joaat("GROUNDBLIZZARD"),
+                              kWhiteout = joaat("WHITEOUT"), kSandstorm = joaat("SANDSTORM");
+        const bool is_hail = (g.weather == kHail || g.weather == kSleet);
+        const bool is_thunder = (g.weather == kThunder || g.weather == kThunderstorm || g.weather == kHurricane);
+        const bool is_storm = is_thunder || g.weather == kBlizzard || g.weather == kGroundBlizzard ||
+                              g.weather == kWhiteout || g.weather == kSandstorm;
+        if ((g.rain > 0.05f || is_hail) && now >= next_drop_) {
+            float intensity = std::max(g.rain, is_hail ? 0.5f : 0.0f);
+            next_drop_ = now + rng_.range(0.5f, 1.5f) / (1.5f + 8.0f * intensity);
+            cues.push_back(make(is_hail ? "hail_drop" : "rain_drop", weather_gain_ * rng_.range(0.35f, 1.0f),
+                                rng_.range(-0.8f, 0.8f), true));
+        }
+        if (is_storm) {
+            if (next_gust_ <= 0) next_gust_ = now + rng_.range(1.5f, 4.0f);
+            else if (now >= next_gust_) {
+                next_gust_ = now + rng_.range(3.5f, 8.5f);
+                cues.push_back(make("wind_gust", weather_gain_ * rng_.range(0.6f, 1.1f), rng_.range(-0.6f, 0.6f), true));
+            }
+        } else {
+            next_gust_ = 0;
+        }
+        if (is_thunder) {
+            if (next_thunder_ <= 0) next_thunder_ = now + rng_.range(2.5f, 6.0f);
+            else if (now >= next_thunder_) {
+                next_thunder_ = now + rng_.range(7.0f, 16.0f);
+                cues.push_back(make("thunder_roll", weather_gain_ * rng_.range(0.7f, 1.2f), rng_.range(-0.7f, 0.7f), true));
+            }
+        } else {
+            next_thunder_ = 0;
         }
     }
     // what Arthur is busy with, felt as a texture while it lasts
@@ -327,43 +431,63 @@ void Features::update(const InputState& in, const GameSnapshot& g, std::vector<W
         // Gun leather, from the weapon in hand changing (the game's holster flag may rise before or after it): the gun
         // that left the hand is holstered, the new one drawn. The speaker only for guns the game carries in the hip
         // holster (attach point 2 / 3: every revolver and pistol and the sawed-off), not for long arms or tools.
-        auto hip = [](int point) { return point == 2 || point == 3; };
-        if (g.weapon != weapon_before_ && action_gain_ > 0) {
+        if (weapon_seen_ && g.weapon != weapon_before_ && action_gain_ > 0) {
             LOGD("weapon change: 0x%08X -> 0x%08X, holstering %d", weapon_before_, g.weapon, int(g.holstering));
-            if (armed_before_) {
+            if (armed_before_ && attach_before_ >= 0) {
                 Cue c = make("gun_holster", action_gain_ * 1.2f, 0.5f, true);
-                c.speaker = hip(attach_before_);
+                c.speaker = (attach_before_ == 2 || attach_before_ == 3);
                 cues.push_back(c);
             }
-            if (g.armed) {
+            if (g.armed && g.attach_point >= 0) {
                 Cue c = make("gun_draw", action_gain_ * 1.2f, 0.5f, true);
-                c.speaker = hip(g.attach_point);
+                c.speaker = (g.attach_point == 2 || g.attach_point == 3);
                 delayed_.push_back({now + (armed_before_ ? 0.25 : 0.0), c});    // after the old gun has gone
             }
         }
+        if (!weapon_seen_) dead_eye_was_ = g.dead_eye;
+        else if (g.dead_eye != dead_eye_was_) {
+            dead_eye_was_ = g.dead_eye;
+            if (g.dead_eye) cues.push_back(make("deadeye_in", 0.65f, 0, false, true));
+            else cues.push_back(make("deadeye_out", 0.50f, 0, false, false));
+        }
+        weapon_seen_ = true;
         armed_before_ = g.armed;
         attach_before_ = g.attach_point;
         weapon_before_ = g.weapon;
-        if (heart_gain_ > 0 && g.health_core < 20 && !g.dead_eye && now >= next_heart_) {
-            next_heart_ = now + 0.9;
-            cues.push_back(make("heartbeat", heart_gain_ * 0.9f));
+        if (heart_gain_ > 0 && !g.dead_eye && now >= next_heart_) {
+            if (g.health_core < 20) {
+                next_heart_ = now + 0.9;
+                cues.push_back(make("heartbeat", heart_gain_ * 0.9f));
+            } else if (g.wanted) {
+                // wanted tension heartbeat: faster and stronger as wanted level increases
+                float wlvl = clampv(float(g.wanted_score) / 600.0f, 0.0f, 1.0f);
+                next_heart_ = now + (1.10 - 0.55 * wlvl);
+                cues.push_back(make("heartbeat", heart_gain_ * (0.45f + 0.45f * wlvl)));
+            }
         }
         if (cold_gain_ > 0 && g.temperature < -5 && now >= next_shiver_) {
             next_shiver_ = now + rng_.range(4.0f, 9.0f);
             cues.push_back(make("shiver", cold_gain_ * clampv((-g.temperature - 5) / 10.0f + 0.4f, 0.4f, 1.0f)));
         }
-    }
-    // a close blast's shock in both triggers: hard at first, dying away over ~0.45 s (the weapon's own trigger feel
-    // steps aside only for that moment)
-    double since = now - shock_t_;
-    if (triggers_on_ && !g.halted && since >= 0 && since < 0.45) {
-        int a = int(std::lround(shock_amp_ * (since < 0.15 ? 8 : since < 0.3 ? 5 : 2)));
-        if (a > 0) {
-            out.r2 = fx::vibration(0, a, 35);
-            out.l2 = out.r2;
+        // carrying a body / heavy load: periodic weight shift while walking + subtle grip resistance
+        if (g.carrying && !g.on_mount && !g.in_vehicle) {
+            if (life_gain_ > 0 && g.speed > 0.6f && now >= next_carry_) {
+                next_carry_ = now + rng_.range(0.85f, 1.4f);
+                cues.push_back(make("carry_shift", life_gain_ * clampv(g.speed / 3.0f, 0.5f, 1.0f), 0.35f, true));
+            }
+            if (triggers_on_ && !g.armed) {
+                out.l2 = fx::feedback(4, 2);
+                out.r2 = fx::feedback(4, 2);
+            }
         }
     }
-    lightbar(g, weapon, now, out);
+    // a close blast's shock in both triggers (~0.45 s) when no active weapon/menu effect holds them
+    double since = now - shock_t_;
+    if (triggers_on_ && !g.halted && !g.blocked && !weapon_active && since >= 0 && since < 0.45) {
+        int a = int(std::lround(shock_amp_ * (since < 0.15 ? 8 : since < 0.3 ? 5 : 2)));
+        if (a > 0) out.l2 = out.r2 = fx::vibration(0, a, 35);
+    }
+    lightbar(in, g, weapon, now, out);
 }
 
 }  // namespace dsr2

@@ -23,9 +23,15 @@ fs::path module_dir() {
 
 // --awc <game dir> line|cut <id hex> <out.wav>: decode a spoken line (stream id) or a whole cutscene file (any of
 // its channel ids) from the game's archives with the mod's own index + decoder, for checking against recordings
+static std::atomic<bool> g_interrupted{false};
+static BOOL WINAPI on_ctrl(DWORD) {
+    g_interrupted = true;
+    return TRUE;
+}
+
 static int awc_tool(int argc, char** argv) {
     using namespace dsr2;
-    if (argc < 6) return 2;
+    if (argc < 4) return 2;
     log::set_debug(true);
     awc::Index& ix = awc::index();
     ix.build(argv[2]);
@@ -59,6 +65,7 @@ static int awc_tool(int argc, char** argv) {
         fclose(o);
         return 0;
     }
+    if (argc < 6) return 2;
     if (std::string(argv[3]) == "pick") {            // which file a line comes from for this voice: pick <id> <voice>
         awc::Entry e;
         uint32_t id = uint32_t(strtoul(argv[4], nullptr, 16)), voice = uint32_t(strtoul(argv[5], nullptr, 16));
@@ -103,6 +110,7 @@ static int awc_tool(int argc, char** argv) {
         ch.resize(1);
         if (!awc::decode_line(ix, found[0], ch[0], rate)) { printf("decode failed\n"); return 1; }
     }
+    if (ch.empty() || rate <= 0) { printf("empty decode\n"); return 1; }
     double dt = now_s() - t0;
     size_t n = ch[0].size();
     for (auto& c : ch) n = std::min(n, c.size());
@@ -137,10 +145,11 @@ int main(int argc, char** argv) {
                "  Lines marked DEBUG show near-misses and words heard but ignored.\n"
                "  The mute button pauses listening. Close this window to stop.\n\n");
         fflush(stdout);
+        SetConsoleCtrlHandler(on_ctrl, TRUE);
         if (!dsr2::core().init(false, "WEAPON_UNARMED")) return 1;
         dsr2::log::set_debug(true);
         double next = 0;
-        while (true) {
+        while (!g_interrupted.load()) {
             dsr2::core().script_tick();
             Sleep(16);
             if (dsr2::now_s() >= next) {        // live mic level, so you can see sound arrives
@@ -153,6 +162,8 @@ int main(int argc, char** argv) {
                 fflush(stdout);
             }
         }
+        dsr2::core().shutdown();
+        return 0;
     }
     std::string weapon = argc > 1 ? argv[1] : "WEAPON_REVOLVER_CATTLEMAN";
     double seconds = argc > 2 ? atof(argv[2]) : 1e9;

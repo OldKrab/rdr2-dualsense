@@ -1,5 +1,9 @@
-DualSense for RDR2  v1.3.0  -  by OldKrab
-==========================================
+DualSense for RDR2  v1.3.0-fork.1  -  Community Fork (based on OldKrab's v1.3.0)
+==============================================================================
+
+Unofficial community fork by TochaRude, adapted with the help of Antigravity
+(not an official collaboration with OldKrab; full credit for the original mod belongs to OldKrab).
+Testers and feedback are welcome: https://github.com/TochaRude/rdr2-dualsense/issues
 
 Full DualSense support for Red Dead Redemption 2 on PC: adaptive triggers made per weapon,
 voice-coil haptics, dialogue you can feel (experimental), lightbar, speaker and microphone - driven by what
@@ -52,33 +56,44 @@ Triggers   Every weapon has its own pull: take-up, wall, crisp break. The shot f
            "ready to shoot"). Recoil shoves back against your finger. Dirty guns feel gritty, exhaustion and
            cold make the pull shaky, express / explosive ammo kicks harder.
 Dead Eye   Every target you paint ticks under your finger; each shot of the volley kicks as it really fires.
-Fishing    R2 loads the cast and tugs when a fish bites (strike!). L2 - the rod grip - carries the real line
-           tension and strains right before the line snaps. You feel the fish surge left / right, the reel
-           click, and the catch flapping in your hand.
-Lasso      Rope tension and jerks while something fights the catch.
+Fishing    R2 progressively loads the cast, pulses on release, and tugs when a fish bites (strike!).
+           L2 - the rod grip - carries the real line tension and strains right before the line snaps. You feel
+           the fish surge left / right, the reel click, and the catch flapping in your hand.
+Lasso      Both L2 and R2 stiffen while holding a roped target, with rope tension, jerks and struggle vibration.
+Bow        Heavy progressive resistance across R2 travel up to full 8/8 force at full draw, staged wood creaks,
+           high-force arm strain after holding too long, early letdown vs. full arrow release.
+Melee      Fists, knives and melee weapons have trigger feedback on swings, blocks and hits, with a heavier
+           dual-trigger impact when landing a knockout or final blow.
 Horse      Hoofbeats from the real hooves at every gait, on the real ground (mud, gravel, wood, grass, snow...),
-           its heartbeat and breathing when it is spent, rearing.
-On foot    Footsteps from Arthur's real feet on the real ground, landings, ledge grabs, doors, drawing and
-           holstering.
+           mounting and dismounting, jump landings, its heartbeat and breathing when it is spent, rearing.
+On foot    Footsteps from Arthur's real feet on the real ground with high contrast across 9 surfaces (deeper and
+           heavier when carrying a body or load, with periodic weight shifts), landings, wagon
+           mounting/dismounting, ledge grabs, doors, drawing and holstering.
 Water      Wading drags at every step - the deeper and the faster, the heavier; a splash as you go in.
 Bushes     A rustle as you walk or ride into them, brushing while you move through.
 Swimming   Every arm pull (left / right hand) and kick, the horse's paddling legs, a splash when you jump in.
-Around you Hits felt from the direction they came from, nearby gunfire, low-health heartbeat, shivering cold.
+Around you Hits felt from the direction they came from, nearby gunfire, low-health and wanted heartbeat,
+           shivering cold, ground rumble and rail clacks when standing near moving trains, wagon ruts.
 Explosions From where and how far they go off, with the real blast; close ones shake the whole controller and
            both triggers.
-Rain       Drops on the hat, as heavy as the game's rain.
+Weather    Rain and hail drops on the hat, storm/blizzard wind gusts, and distant thunder rolls.
 Fights     While shots fly, steps, hooves and rain step back so the fight comes through.
 Cutscenes  Steps, hooves, shots and hits are felt in cutscenes too.
+Menus      Adaptive triggers stay completely relaxed and controller haptics/speaker output stay silent in main
+           menus, pause menus, and loading screens.
 Dialogue   (experimental, off by default) Every spoken line as the speaker's voice in your hands - see below.
 Honor      A warm swell and gold glow when honor rises, a sinking thud when it falls.
 Camp life  Bites, sips and puffs, cleaning your gun, brushing / feeding the horse, skinning, stowing pelts,
-           picking herbs, bathing, crafting, cooking.
+           multi-stage herb plucking (stem snap + root pull), bathing, crafting, cooking.
 Table games Five finger fillet (every stab - and the miss), poker and blackjack chips and cards, dominoes.
 Weapon wheel L2/R2 click like a selector switch while you browse.
-Lightbar   Muzzle flash, hits, Dead Eye, lantern flicker, wanted, low health, time of day.
-           Player LEDs show the rounds left.
-Speaker    The game's own draw / holster / lasso sounds and mechanism clicks from the controller
-           (off by default: Sounds from the Controller).
+Lightbar   Muzzle flash, hits, Dead Eye, lantern flicker, wanted police flash, low health, time of day.
+           Player LEDs show rounds left when armed, appear for 3.5 s whenever health changes (PlayerLeds=auto|health|ammo|off),
+           and animate a police-light sweep when wanted.
+Speaker    Focused controller speaker audio (off by default: Sounds from the Controller): authentic in-game
+           recordings (weapon draw / holster, lasso throw & rope jerks, bow creak, blade impacts & skinning)
+           plus crisp mechanical clicks (cocking, lever / bolt / pump actions, live per-round reloads, dry fire,
+           fishing reel clicks, weapon wheel & Dead Eye marks). Turning it off enforces a real hardware mute.
 
 
 DIALOGUE HAPTICS (experimental, off by default)
@@ -126,6 +141,25 @@ Source code (MIT): see the mod page.
 
 CHANGES
 -------
+1.3.0-fork.1  Community fork release based on OldKrab's v1.3.0 (adapted with Antigravity):
+              Controller Speaker: enforced real HID hardware speaker mute + audio-thread voice purge when
+              Mechanics=0; focused speaker output strictly on authentic in-game RDR2 .awc recordings (hip-holster
+              weapon draw/holster, lasso, bow creak, blade/skinning) and crisp mechanical clicks (cocking,
+              lever/bolt/pump, live per-round reloads, dry fire, reel clicks, wheel tick, Dead Eye marks).
+              Triggers & Combat: heavy progressive bow resistance (FEEDBACK up to 8/8 torque + staged creaks
+              and arm strain), break-aligned dry click, KickStrength=0 recoil off + auto-align safety clamp,
+              dual-trigger L2+R2 lasso struggle, smooth progressive R2 fishing cast + release pulse, melee on
+              CIRCLE + KO finishers (R1 kept free for Take Cover & Horse Brake), Double-Action variants break
+              at zone 8, WEAPON_OBJECT / Electric Lantern filtering, and completely relaxed/silent triggers &
+              haptics in main menus, pause menus, and loading screens.
+              World & LEDs: high-contrast tuning across all 9 ground surfaces + 5.5 cm slow-walk sensitivity,
+              state-driven horse/wagon mounting (excluding trains/boats), event-driven multi-stage herb
+              plucking, nearby moving train rumble, hail/gust/thunder weather, carrying load weight/grip,
+              on-change 3.5 s Health Player LEDs, explicit PlayerLeds=off clearing, and wanted police-light
+              LED sweep + tension heartbeat.
+              Fixes: async Win32 DllMain boot, native right-stick deadzone preserved with clean still-only L2
+              gyro bias/free-aim gating, clean overlapped HID cancellation, Loader-Lock-safe unload handling,
+              thread-safe speaker/gameaudio locking, immediate log flush, and dynamic 0x05 HID calibration.
 1.3.0  Haptics over Bluetooth: everything you feel over USB now works without the cable too (not the
        controller's speaker and microphone). Bluetooth=0 in the ini goes back to the plain rumble motors -
        then without the rain, bush and wading textures, which only blurred into one endless rumble there.

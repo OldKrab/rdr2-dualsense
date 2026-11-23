@@ -5,5 +5,6 @@
 namespace dsr2 {
 
 void text_inject_start();
+void text_inject_stop();
 
 }  // namespace dsr2

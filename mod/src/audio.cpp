@@ -66,17 +66,44 @@ std::wstring device_bus(IMMDevice* dev) {
     return out;
 }
 
-// endpoint whose name contains `match` (and not `exclude`); empty match = default endpoint
+// Device instance ID (e.g. "SWD\MMDEVAPI\..." or parent USB VID/PID "VID_054C&PID_0CE6")
+std::wstring device_instance_id(IMMDevice* dev) {
+    // PKEY_Device_InstanceId {78c34fc8-104a-4aca-9ea4-524d52996e57}, 256
+    static const PROPERTYKEY kInstanceId = {{0x78c34fc8, 0x104a, 0x4aca, {0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0x57}}, 256};
+    ComPtr<IPropertyStore> props;
+    std::wstring out;
+    if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &props))) {
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        if (SUCCEEDED(props->GetValue(kInstanceId, &v)) && v.vt == VT_LPWSTR) out = v.pwszVal;
+        PropVariantClear(&v);
+    }
+    return out;
+}
+
+bool is_dualsense_endpoint(IMMDevice* dev) {
+    std::wstring id = device_instance_id(dev);
+    if (contains_ci(id, L"VID_054C&PID_0CE6") || contains_ci(id, L"VID_054C&PID_0DF2")) return true;
+    return contains_ci(device_name(dev), L"DualSense");
+}
+
+// endpoint whose name contains `match` (and not `exclude`); empty match = default endpoint.
+// When `match` is L"DualSense", also matches by Sony DualSense USB VID/PID even if renamed.
 IMMDevice* find_endpoint(EDataFlow flow, const std::wstring& match, const std::wstring& exclude) {
     ComPtr<IMMDeviceEnumerator> en;
     if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en)))
         return nullptr;
+    auto excluded = [&](IMMDevice* d) {
+        if (exclude.empty()) return false;
+        if (contains_ci(exclude, L"DualSense") && is_dualsense_endpoint(d)) return true;
+        return contains_ci(device_name(d), exclude);
+    };
     if (match.empty()) {
         // the default output (multimedia, then console role), unless it is the excluded device
         for (ERole role : {eMultimedia, eConsole}) {
             IMMDevice* d = nullptr;
             if (FAILED(en->GetDefaultAudioEndpoint(flow, role, &d)) || !d) continue;
-            if (exclude.empty() || !contains_ci(device_name(d), exclude)) return d;
+            if (!excluded(d)) return d;
             d->Release();
         }
     }
@@ -84,12 +111,12 @@ IMMDevice* find_endpoint(EDataFlow flow, const std::wstring& match, const std::w
     if (FAILED(en->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &col))) return nullptr;
     UINT n = 0;
     col->GetCount(&n);
+    const bool want_ds = contains_ci(match, L"DualSense");
     for (UINT i = 0; i < n; ++i) {
         IMMDevice* d = nullptr;
         if (FAILED(col->Item(i, &d))) continue;
-        std::wstring nm = device_name(d);
-        // empty match: first active device that is not excluded (fallback when the default is the controller)
-        if ((match.empty() || contains_ci(nm, match)) && (exclude.empty() || !contains_ci(nm, exclude))) return d;
+        bool matched = match.empty() || (want_ds ? is_dualsense_endpoint(d) : contains_ci(device_name(d), match));
+        if (matched && !excluded(d)) return d;
         d->Release();
     }
     return nullptr;
@@ -107,6 +134,11 @@ bool is_float(const WAVEFORMATEX* f) {
 float sample_at(const BYTE* data, const WAVEFORMATEX* f, size_t frame, int ch) {
     if (is_float(f)) return reinterpret_cast<const float*>(data)[frame * f->nChannels + ch];
     if (f->wBitsPerSample == 16) return reinterpret_cast<const int16_t*>(data)[frame * f->nChannels + ch] / 32768.0f;
+    if (f->wBitsPerSample == 24) {
+        const BYTE* p = data + (frame * f->nChannels + size_t(ch)) * 3;
+        int32_t v = int32_t(p[0]) | (int32_t(p[1]) << 8) | (int32_t(int8_t(p[2])) << 16);
+        return v / 8388608.0f;
+    }
     if (f->wBitsPerSample == 32) return float(reinterpret_cast<const int32_t*>(data)[frame * f->nChannels + ch] / 2147483648.0);
     return 0.0f;
 }
@@ -133,35 +165,37 @@ bool default_output(std::string& name, bool& bluetooth) {
 std::string describe_outputs() {
     HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     std::string out;
-    ComPtr<IMMDeviceEnumerator> en;
-    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en))) {
-        std::wstring def;
-        IMMDevice* dd = nullptr;
-        if (SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eMultimedia, &dd)) && dd) { def = device_name(dd); dd->Release(); }
-        ComPtr<IMMDeviceCollection> col;
-        UINT n = 0;
-        if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col))) col->GetCount(&n);
-        for (UINT i = 0; i < n; ++i) {
-            IMMDevice* d = nullptr;
-            if (FAILED(col->Item(i, &d))) continue;
-            std::wstring nm = device_name(d);
-            ComPtr<IAudioClient> cl;
-            WAVEFORMATEX* fmt = nullptr;
-            REFERENCE_TIME lat = 0, per_def = 0, per_min = 0;
-            UINT32 frames = 0;
-            if (SUCCEEDED(d->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&cl)) && SUCCEEDED(cl->GetMixFormat(&fmt)) &&
-                SUCCEEDED(cl->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, fmt, nullptr))) {
-                cl->GetStreamLatency(&lat);
-                cl->GetDevicePeriod(&per_def, &per_min);
-                cl->GetBufferSize(&frames);
+    {
+        ComPtr<IMMDeviceEnumerator> en;
+        if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en))) {
+            std::wstring def;
+            IMMDevice* dd = nullptr;
+            if (SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eMultimedia, &dd)) && dd) { def = device_name(dd); dd->Release(); }
+            ComPtr<IMMDeviceCollection> col;
+            UINT n = 0;
+            if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &col))) col->GetCount(&n);
+            for (UINT i = 0; i < n; ++i) {
+                IMMDevice* d = nullptr;
+                if (FAILED(col->Item(i, &d))) continue;
+                std::wstring nm = device_name(d);
+                ComPtr<IAudioClient> cl;
+                WAVEFORMATEX* fmt = nullptr;
+                REFERENCE_TIME lat = 0, per_def = 0, per_min = 0;
+                UINT32 frames = 0;
+                if (SUCCEEDED(d->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&cl)) && SUCCEEDED(cl->GetMixFormat(&fmt)) &&
+                    SUCCEEDED(cl->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, fmt, nullptr))) {
+                    cl->GetStreamLatency(&lat);
+                    cl->GetDevicePeriod(&per_def, &per_min);
+                    cl->GetBufferSize(&frames);
+                }
+                char line[512];
+                snprintf(line, sizeof line, "%s %-50s bus %-12s stream latency %5.1f ms, period %4.1f ms, buffer %5.1f ms\n",
+                         nm == def ? "*" : " ", narrow(nm).c_str(), narrow(device_bus(d)).c_str(), lat / 1e4, per_def / 1e4,
+                         fmt && fmt->nSamplesPerSec ? 1000.0 * frames / fmt->nSamplesPerSec : 0.0);
+                out += line;
+                if (fmt) CoTaskMemFree(fmt);
+                d->Release();
             }
-            char line[512];
-            snprintf(line, sizeof line, "%s %-50s bus %-12s stream latency %5.1f ms, period %4.1f ms, buffer %5.1f ms\n",
-                     nm == def ? "*" : " ", narrow(nm).c_str(), narrow(device_bus(d)).c_str(), lat / 1e4, per_def / 1e4,
-                     fmt && fmt->nSamplesPerSec ? 1000.0 * frames / fmt->nSamplesPerSec : 0.0);
-            out += line;
-            if (fmt) CoTaskMemFree(fmt);
-            d->Release();
         }
     }
     if (SUCCEEDED(co)) CoUninitialize();
@@ -169,8 +203,12 @@ std::string describe_outputs() {
 }
 
 bool AudioEngine::start(HapticLibrary* lib) {
+    std::lock_guard<std::mutex> l(restart_mu_);
     lib_ = lib;
     ring_.assign(size_t(dsp::kSR) * 2, 0.0f);     // 0.5 s stereo
+    ring_r_.store(0, std::memory_order_relaxed);
+    ring_w_.store(0, std::memory_order_relaxed);
+    mix_voices_.reserve(64);
     running_ = true;
     render_ = std::thread([this] { render_thread(); });
     return true;
@@ -178,6 +216,7 @@ bool AudioEngine::start(HapticLibrary* lib) {
 
 void AudioEngine::stop() {
     running_ = false;
+    mic_running_ = false;
     for (auto* t : {&render_, &loop_, &mic_})
         if (t->joinable()) t->join();
     ok_ = false;
@@ -186,11 +225,38 @@ void AudioEngine::stop() {
 void AudioEngine::restart() {
     std::lock_guard<std::mutex> l(restart_mu_);
     stop();
+    {
+        std::lock_guard<std::mutex> ml(mu_);
+        incoming_.clear();
+        mix_voices_.clear();
+        env_voices_.clear();
+    }
+    ring_r_.store(0, std::memory_order_relaxed);
+    ring_w_.store(0, std::memory_order_relaxed);
+    purge_speaker_.store(false, std::memory_order_relaxed);
     running_ = true;
     render_ = std::thread([this] { render_thread(); });
-    if (ga_started_) loop_ = std::thread([this] { loopback_thread(ga_hint_); });
-    if (mic_started_) mic_ = std::thread([this] { mic_thread(mic_sens_); });
+    if (ga_started_) {
+        ga_running_ = true;
+        loop_ = std::thread([this] { loopback_thread(ga_hint_); });
+    }
+    if (mic_started_) {
+        mic_running_ = true;
+        mic_ = std::thread([this] { mic_thread(mic_sens_.load()); });
+    }
     LOGI("audio devices reopened");
+}
+
+void AudioEngine::set_speaker_volume(float v) {
+    speaker_vol_ = v;
+    if (v <= 0.001f) {
+        {
+            std::lock_guard<std::mutex> l(mu_);
+            incoming_.erase(std::remove_if(incoming_.begin(), incoming_.end(), [](const Voice& x) { return x.speaker; }),
+                            incoming_.end());
+        }
+        purge_speaker_.store(true, std::memory_order_release);
+    }
 }
 
 void AudioEngine::play(const Cue& c) {
@@ -198,27 +264,30 @@ void AudioEngine::play(const Cue& c) {
     Cue cue = c;
     cue.gain *= strength_.load();
     if (!lib_ || !lib_->render(cue, buf)) return;
-    std::lock_guard<std::mutex> l(mu_);
-    if (ok_) incoming_.push_back({std::move(buf), 0, false, c.scripted});
-    else {
-        // Bluetooth: keep an envelope for the rumble motors
-        EnvVoice v;
-        v.t0 = now_s();
+    const bool live = ok_.load();
+    EnvVoice env_v;
+    if (!live) {
+        // Bluetooth rumble fallback: compute envelope outside mu_ so we never stall the render thread
+        env_v.t0 = now_s();
         const size_t hop = size_t(dsp::kSR * 0.004) * 2;
+        env_v.env.reserve(buf.size() / hop + 1);
         for (size_t i = 0; i < buf.size(); i += hop) {
             float l = 0, r = 0;
             for (size_t k = i; k < std::min(buf.size(), i + hop); k += 2) {
                 l = std::max(l, std::fabs(buf[k]));
                 r = std::max(r, std::fabs(buf[k + 1]));
             }
-            v.env.push_back({l, r});
+            env_v.env.push_back({l, r});
         }
-        env_voices_.push_back(std::move(v));
     }
-    if (c.speaker && ok_ && !bt_active_) {
-        Stereo spk;
-        if (lib_->speaker_sound(c, spk)) incoming_.push_back({std::move(spk), 0, true, false});
-    }
+    Stereo spk;
+    bool has_spk = false;
+    if (c.speaker && live && !bt_active_.load() && speaker_vol_.load() > 0.001f)
+        has_spk = lib_->speaker_sound(c, spk);
+    std::lock_guard<std::mutex> l(mu_);
+    if (live) incoming_.push_back({std::move(buf), 0, false, c.scripted});
+    else env_voices_.push_back(std::move(env_v));
+    if (has_spk) incoming_.push_back({std::move(spk), 0, true, false});
 }
 
 void AudioEngine::track_play(uint64_t key, std::shared_ptr<const std::vector<float>> mono, double t0, float gl, float gr) {
@@ -226,6 +295,7 @@ void AudioEngine::track_play(uint64_t key, std::shared_ptr<const std::vector<flo
     Track& t = tracks_[key];
     t.mono = std::move(mono);
     t.t0 = t0;
+    t.pos_init = false;
     t.gl = gl;
     t.gr = gr;
     t.stopping = false;
@@ -235,6 +305,7 @@ void AudioEngine::track_move(uint64_t key, double t0, float gl, float gr) {
     std::lock_guard<std::mutex> l(mu_);
     auto it = tracks_.find(key);
     if (it == tracks_.end()) return;
+    if (std::fabs(it->second.t0 - t0) > 0.02) it->second.pos_init = false;
     it->second.t0 = t0;
     it->second.gl = gl;
     it->second.gr = gr;
@@ -260,9 +331,11 @@ int AudioEngine::track_count() {
 void AudioEngine::rumble_tick(double now, uint8_t& left, uint8_t& right) {
     float l = 0, r = 0;
     std::lock_guard<std::mutex> lk(mu_);
-    while (!env_voices_.empty() && (now - env_voices_.front().t0) / 0.004 >= env_voices_.front().env.size())
+    while (!env_voices_.empty() && now >= env_voices_.front().t0 &&
+           (now - env_voices_.front().t0) / 0.004 >= env_voices_.front().env.size())
         env_voices_.pop_front();
     for (auto& v : env_voices_) {
+        if (now < v.t0) continue;
         size_t i = size_t((now - v.t0) / 0.004);
         if (i < v.env.size()) {
             l = std::max(l, v.env[i].first);
@@ -277,71 +350,86 @@ void AudioEngine::rumble_tick(double now, uint8_t& left, uint8_t& right) {
 }
 
 void AudioEngine::render_thread() {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    IMMDevice* dev = find_endpoint(eRender, L"DualSense", L"");
-    if (!dev) {
-        CoUninitialize();
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool fallback_bt = false;
+    {
+        IMMDevice* dev = find_endpoint(eRender, L"DualSense", L"");
+        if (!dev) {
+            fallback_bt = true;
+        } else {
+            LOGI("haptics output: %s", narrow(device_name(dev)).c_str());
+            ComPtr<IAudioClient> client;
+            ComPtr<IAudioRenderClient> render;
+            WAVEFORMATEX* fmt = nullptr;
+            HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            bool good = SUCCEEDED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client)) &&
+                        SUCCEEDED(client->GetMixFormat(&fmt)) && fmt->nChannels >= 4 &&
+                        SUCCEEDED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 100000, 0, fmt, nullptr)) &&
+                        SUCCEEDED(client->SetEventHandle(ev)) &&
+                        SUCCEEDED(client->GetService(__uuidof(IAudioRenderClient), (void**)&render));
+            dev->Release();
+            if (!good) {
+                LOGE("could not open the DualSense audio device (channels %d)", fmt ? fmt->nChannels : 0);
+                if (fmt) CoTaskMemFree(fmt);
+                if (ev) CloseHandle(ev);
+            } else {
+                UINT32 frames = 0;
+                client->GetBufferSize(&frames);
+                REFERENCE_TIME lat = 0;
+                client->GetStreamLatency(&lat);
+                latency_ms_ = float(lat) / 10000.0f + 1000.0f * frames / fmt->nSamplesPerSec / 2;
+                const int ch = fmt->nChannels;
+                const bool flt = is_float(fmt);
+                const int bps = fmt->wBitsPerSample;
+                if (fmt->nSamplesPerSec != dsp::kSR)
+                    LOGW("haptics device runs at %lu Hz (expected 48000) - effects will play at the wrong speed", fmt->nSamplesPerSec);
+                LOGI("haptics stream: %d ch, %lu Hz, %s (%d bit), buffer %u frames, latency %.1f ms", ch, fmt->nSamplesPerSec,
+                     flt ? "float" : "pcm", bps, frames, latency_ms_.load());
+                DWORD task = 0;
+                HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &task);
+                client->Start();
+                ok_ = true;
+                std::vector<float> mix;
+                mix.reserve(size_t(frames) * 4);
+                while (running_) {
+                    if (WaitForSingleObject(ev, 200) != WAIT_OBJECT_0) continue;
+                    UINT32 pad = 0;
+                    if (FAILED(client->GetCurrentPadding(&pad))) break;
+                    UINT32 n = frames - pad;
+                    if (!n) continue;
+                    mix_block(mix, n, float(fmt->nSamplesPerSec));
+                    BYTE* out = nullptr;
+                    if (FAILED(render->GetBuffer(n, &out))) break;
+                    for (UINT32 i = 0; i < n; ++i)
+                        for (int c = 0; c < ch; ++c) {
+                            float s = c < 4 ? clampv(mix[size_t(i) * 4 + c], -1.0f, 1.0f) : 0.0f;
+                            size_t idx = size_t(i) * ch + c;
+                            if (flt) reinterpret_cast<float*>(out)[idx] = s;
+                            else if (bps == 16) reinterpret_cast<int16_t*>(out)[idx] = int16_t(s * 32767.0f);
+                            else if (bps == 24) {
+                                int32_t v = int32_t(s * 8388607.0f);
+                                out[idx * 3 + 0] = BYTE(v & 0xFF);
+                                out[idx * 3 + 1] = BYTE((v >> 8) & 0xFF);
+                                out[idx * 3 + 2] = BYTE((v >> 16) & 0xFF);
+                            } else if (bps == 32) {
+                                reinterpret_cast<int32_t*>(out)[idx] = int32_t(s * 2147483647.0);
+                            }
+                        }
+                    render->ReleaseBuffer(n, 0);
+                }
+                ok_ = false;
+                client->Stop();
+                if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
+                CoTaskMemFree(fmt);
+                if (ev) CloseHandle(ev);
+            }
+        }
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+    if (fallback_bt) {
         if (bt_sink_) bt_loop();             // Bluetooth: haptics in the controller's HID reports (or rumble)
         else LOGW("DualSense audio device not found - haptics fall back to rumble emulation (Bluetooth?)");
-        return;
     }
-    LOGI("haptics output: %s", narrow(device_name(dev)).c_str());
-    ComPtr<IAudioClient> client;
-    ComPtr<IAudioRenderClient> render;
-    WAVEFORMATEX* fmt = nullptr;
-    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    bool good = SUCCEEDED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client)) &&
-                SUCCEEDED(client->GetMixFormat(&fmt)) && fmt->nChannels >= 4 &&
-                SUCCEEDED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 100000, 0, fmt, nullptr)) &&
-                SUCCEEDED(client->SetEventHandle(ev)) &&
-                SUCCEEDED(client->GetService(__uuidof(IAudioRenderClient), (void**)&render));
-    dev->Release();
-    if (!good) {
-        LOGE("could not open the DualSense audio device (channels %d)", fmt ? fmt->nChannels : 0);
-        if (fmt) CoTaskMemFree(fmt);
-        CloseHandle(ev);
-        CoUninitialize();
-        return;
-    }
-    UINT32 frames = 0;
-    client->GetBufferSize(&frames);
-    REFERENCE_TIME lat = 0;
-    client->GetStreamLatency(&lat);
-    latency_ms_ = float(lat) / 10000.0f + 1000.0f * frames / fmt->nSamplesPerSec / 2;
-    const int ch = fmt->nChannels;
-    const bool flt = is_float(fmt);
-    if (fmt->nSamplesPerSec != dsp::kSR)
-        LOGW("haptics device runs at %lu Hz (expected 48000) - effects will play at the wrong speed", fmt->nSamplesPerSec);
-    LOGI("haptics stream: %d ch, %lu Hz, %s, buffer %u frames, latency %.1f ms", ch, fmt->nSamplesPerSec,
-         flt ? "float" : "pcm", frames, latency_ms_.load());
-    DWORD task = 0;
-    HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &task);
-    client->Start();
-    ok_ = true;
-    std::vector<float> mix;
-    while (running_) {
-        if (WaitForSingleObject(ev, 200) != WAIT_OBJECT_0) continue;
-        UINT32 pad = 0;
-        if (FAILED(client->GetCurrentPadding(&pad))) break;
-        UINT32 n = frames - pad;
-        if (!n) continue;
-        mix_block(mix, n, float(fmt->nSamplesPerSec));
-        BYTE* out = nullptr;
-        if (FAILED(render->GetBuffer(n, &out))) break;
-        for (UINT32 i = 0; i < n; ++i)
-            for (int c = 0; c < ch; ++c) {
-                float s = c < 4 ? clampv(mix[size_t(i) * 4 + c], -1.0f, 1.0f) : 0.0f;
-                if (flt) reinterpret_cast<float*>(out)[size_t(i) * ch + c] = s;
-                else reinterpret_cast<int16_t*>(out)[size_t(i) * ch + c] = int16_t(s * 32767);
-            }
-        render->ReleaseBuffer(n, 0);
-    }
-    ok_ = false;
-    client->Stop();
-    if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
-    CoTaskMemFree(fmt);
-    CloseHandle(ev);
-    CoUninitialize();
 }
 
 // One block of the mix (4 channels: speaker L/R, haptics L/R) at sample rate sr: the game's rumble as vibration, the
@@ -353,6 +441,10 @@ void AudioEngine::mix_block(std::vector<float>& mix, uint32_t n, float sr) {
         for (auto& v : incoming_) mix_voices_.push_back(std::move(v));
         incoming_.clear();
     }
+    if (purge_speaker_.exchange(false, std::memory_order_acquire)) {
+        mix_voices_.erase(std::remove_if(mix_voices_.begin(), mix_voices_.end(), [](const Voice& v) { return v.speaker; }),
+                          mix_voices_.end());
+    }
     mix.assign(size_t(n) * 4, 0.0f);    // ch0/1 speaker, ch2/3 haptics
     bool scripted = false;
     for (auto& v : mix_voices_) scripted |= v.scripted && !v.speaker;
@@ -361,6 +453,15 @@ void AudioEngine::mix_block(std::vector<float>& mix, uint32_t n, float sr) {
     float strength = strength_.load(), spk = speaker_vol_.load();
     float rg = rumble_gain_.load() * strength, ga = game_audio_gain_.load() * strength;
     float tl = rumble_low_.load(), th = rumble_high_.load();
+    // Strict SPSC consumer: drop stale backlog (> 40 ms) from the consumer side only
+    size_t r = ring_r_.load(std::memory_order_relaxed);
+    size_t w = ring_w_.load(std::memory_order_acquire);
+    const size_t rsz = ring_.size();
+    if (rsz > 0) {
+        size_t fill = (w + rsz - r) % rsz;
+        const size_t max_fill = size_t(dsp::kSR * 0.04) * 2;
+        if (fill > max_fill) r = (w + rsz - size_t(dsp::kSR * 0.015) * 2) % rsz;
+    }
     for (uint32_t i = 0; i < n; ++i) {
         duck_ += (duck_target - duck_) * (duck_target < duck_ ? 0.01f : 0.0003f);
         // the game's rumble motors as voice-coil vibration (low ~45 Hz, high ~150 Hz)
@@ -373,15 +474,15 @@ void AudioEngine::mix_block(std::vector<float>& mix, uint32_t n, float sr) {
         float rum = (std::sin(ph_l_) * rl_ * 0.8f + std::sin(ph_h_) * rh_ * 0.5f) * rg * duck_;
         float hl = rum, hr = rum;
         // game-audio layer
-        size_t r = ring_r_.load(), w = ring_w_.load();
         if (r != w) {
             hl += ring_[r] * ga * duck_;
             hr += ring_[r + 1] * ga * duck_;
-            ring_r_ = (r + 2) % ring_.size();
+            r = (r + 2) % rsz;
         }
         mix[size_t(i) * 4 + 2] = hl;
         mix[size_t(i) * 4 + 3] = hr;
     }
+    ring_r_.store(r, std::memory_order_release);
     // voices are 48 kHz; the device is normally 48 kHz too (ratio 1)
     for (auto& v : mix_voices_) {
         size_t frames_v = v.buf.size() / 2;
@@ -401,7 +502,7 @@ void AudioEngine::mix_block(std::vector<float>& mix, uint32_t n, float sr) {
     }
     mix_voices_.erase(std::remove_if(mix_voices_.begin(), mix_voices_.end(), [](const Voice& v) { return v.pos >= v.buf.size() / 2; }),
                       mix_voices_.end());
-    // tracks on the game's clock: the first sample written now is felt one device latency later
+    // tracks on the game's clock: continuous sample cursor to avoid QPC jitter clicks; resync only on large drift
     {
         std::lock_guard<std::mutex> l(mu_);
         const double felt = now_s() + latency_ms_.load() / 1000.0;
@@ -410,7 +511,13 @@ void AudioEngine::mix_block(std::vector<float>& mix, uint32_t n, float sr) {
         for (auto it = tracks_.begin(); it != tracks_.end();) {
             Track& t = it->second;
             const std::vector<float>& m = *t.mono;
-            const long long k0 = (long long)std::floor((felt - t.t0) * dsp::kSR);
+            const long long k_target = (long long)std::floor((felt - t.t0) * dsp::kSR);
+            if (!t.pos_init || std::llabs(t.pos - k_target) > 400) {    // > ~8.3 ms drift or first block
+                t.pos = k_target;
+                t.pos_init = true;
+            }
+            const long long k0 = t.pos;
+            t.pos += n;
             const bool silent = t.stopping || muted;
             float tl = silent ? 0.0f : t.gl * strength, tr = silent ? 0.0f : t.gr * strength;
             for (uint32_t i = 0; i < n; ++i) {
@@ -427,16 +534,12 @@ void AudioEngine::mix_block(std::vector<float>& mix, uint32_t n, float sr) {
     }
 }
 
-// Bluetooth: Windows has no sound device for the controller then, so the haptics go to it as audio inside HID output
-// reports - 3 kHz, 8 bit, stereo, 32 frames per report, ~94 reports a second (DualSense::send_haptics). The format was
-// worked out by SAxense (https://apps.sdore.me/SAxense). The same mix as over USB, averaged down 16:1 (the haptics
-// live below ~300 Hz). Not ready (USB, no controller) or switched off: the rumble fallback (ok() false).
 void AudioEngine::bt_loop() {
-    timeBeginPeriod(1);
     std::vector<float> mix;
+    mix.reserve(512 * 4);
     const double period = 64.0 / 6000.0;                 // 32 frames at 3 kHz
     double next = now_s(), fail_log_t = 0;
-    bool active = false, warned = false;
+    bool active = false, warned = false, timer_hi = false;
     int fails = 0;
     while (running_) {
         const bool ready = bt_on_.load() && bt_ready_ && bt_ready_();
@@ -446,6 +549,8 @@ void AudioEngine::bt_loop() {
             latency_ms_ = ready ? 30.0f : 0.0f;          // one report + the Bluetooth link (estimate)
             ok_ = ready;
             next = now_s();
+            if (ready && !timer_hi) { timeBeginPeriod(1); timer_hi = true; }
+            else if (!ready && timer_hi) { timeEndPeriod(1); timer_hi = false; }
             if (ready) LOGI("haptics output: DualSense over Bluetooth (audio in HID reports, %s%s)",
                             bt_u8_.load() ? "unsigned" : "signed", bt_swap_.load() ? ", channels swapped" : "");
         }
@@ -489,233 +594,281 @@ void AudioEngine::bt_loop() {
     }
     bt_active_ = false;
     ok_ = false;
-    timeEndPeriod(1);
+    if (timer_hi) timeEndPeriod(1);
 }
 
 void AudioEngine::start_game_audio(float gain, const std::string& hint) {
+    std::lock_guard<std::mutex> l(restart_mu_);
     game_audio_gain_ = gain;
+    if (loop_.joinable() && !ga_running_.load()) loop_.join();
     if (gain <= 0 || loop_.joinable()) return;
     ga_started_ = true;
     ga_hint_ = hint;
+    ga_running_ = true;
     loop_ = std::thread([this, hint] { loopback_thread(hint); });
 }
 
 void AudioEngine::loopback_thread(std::string hint) {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    std::wstring whint(hint.begin(), hint.end());
-    // the output the game plays on: the default one (or the configured one)
-    IMMDevice* dev = find_endpoint(eRender, whint, L"");
-    if (!dev) {
-        LOGW("game-audio layer: no audio output to listen to");
-        CoUninitialize();
-        return;
-    }
-    // if that is the controller itself (headphones in its jack), only its sound channels are
-    // captured - channels 3/4 carry our own haptics and must not feed back
-    const bool controller = contains_ci(device_name(dev), L"DualSense");
-    LOGI("game-audio layer listens to: %s%s", narrow(device_name(dev)).c_str(),
-         controller ? " (sound channels only)" : "");
-    ComPtr<IAudioClient> client;
-    ComPtr<IAudioCaptureClient> cap;
-    WAVEFORMATEX* fmt = nullptr;
-    bool good = SUCCEEDED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client)) &&
-                SUCCEEDED(client->GetMixFormat(&fmt)) &&
-                SUCCEEDED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 200000, 0, fmt, nullptr)) &&
-                SUCCEEDED(client->GetService(__uuidof(IAudioCaptureClient), (void**)&cap));
-    dev->Release();
-    if (!good) {
-        LOGE("game-audio layer: loopback capture failed");
-        if (fmt) CoTaskMemFree(fmt);
-        CoUninitialize();
-        return;
-    }
-    const int ch = fmt->nChannels;
-    const double step = double(fmt->nSamplesPerSec) / dsp::kSR;
-    LOGI("game-audio layer: %d ch %lu Hz", ch, fmt->nSamplesPerSec);
-    dsp::StreamConverter conv;
-    conv.gain = 1.0f;
-    client->Start();
-    double rs_pos = 0;
-    float prev_l = 0, prev_r = 0;
-    while (running_) {
-        Sleep(4);
-        UINT32 packet = 0;
-        while (SUCCEEDED(cap->GetNextPacketSize(&packet)) && packet) {
-            BYTE* data = nullptr;
-            UINT32 n = 0;
-            DWORD flags = 0;
-            if (FAILED(cap->GetBuffer(&data, &n, &flags, nullptr, nullptr))) break;
-            bool silent = flags & AUDCLNT_BUFFERFLAGS_SILENT;
-            for (UINT32 i = 0; i < n; ++i) {
-                float l = 0, r = 0;
-                if (!silent) {
-                    // downmix: front L/R plus centre, LFE and surrounds
-                    l = sample_at(data, fmt, i, 0);
-                    r = ch > 1 ? sample_at(data, fmt, i, 1) : l;
-                    if (ch >= 6 && !controller) {
-                        float c = sample_at(data, fmt, i, 2), lfe = sample_at(data, fmt, i, 3);
-                        l += 0.7f * c + 0.7f * lfe + 0.6f * sample_at(data, fmt, i, 4);
-                        r += 0.7f * c + 0.7f * lfe + 0.6f * sample_at(data, fmt, i, 5);
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    {
+        std::wstring whint(hint.begin(), hint.end());
+        IMMDevice* dev = find_endpoint(eRender, whint, L"");
+        if (!dev) {
+            LOGW("game-audio layer: no audio output to listen to");
+        } else {
+            const bool controller = is_dualsense_endpoint(dev);
+            LOGI("game-audio layer listens to: %s%s", narrow(device_name(dev)).c_str(),
+                 controller ? " (sound channels only)" : "");
+            ComPtr<IAudioClient> client;
+            ComPtr<IAudioCaptureClient> cap;
+            WAVEFORMATEX* fmt = nullptr;
+            bool good = SUCCEEDED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client)) &&
+                        SUCCEEDED(client->GetMixFormat(&fmt)) &&
+                        SUCCEEDED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 200000, 0, fmt, nullptr)) &&
+                        SUCCEEDED(client->GetService(__uuidof(IAudioCaptureClient), (void**)&cap));
+            dev->Release();
+            if (!good) {
+                LOGE("game-audio layer: loopback capture failed");
+                if (fmt) CoTaskMemFree(fmt);
+            } else {
+                const int ch = fmt->nChannels;
+                const double step = double(fmt->nSamplesPerSec) / dsp::kSR;
+                LOGI("game-audio layer: %d ch %lu Hz", ch, fmt->nSamplesPerSec);
+                dsp::StreamConverter conv;
+                conv.gain = 1.0f;
+                client->Start();
+                double rs_pos = 0;
+                float prev_l = 0, prev_r = 0;
+                const size_t rsz = ring_.size();
+                while (running_) {
+                    Sleep(4);
+                    UINT32 packet = 0;
+                    HRESULT hr = cap->GetNextPacketSize(&packet);
+                    if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+                        LOGW("game-audio layer: output device disconnected");
+                        break;
+                    }
+                    while (SUCCEEDED(hr) && packet) {
+                        BYTE* data = nullptr;
+                        UINT32 n = 0;
+                        DWORD flags = 0;
+                        if (FAILED(cap->GetBuffer(&data, &n, &flags, nullptr, nullptr))) break;
+                        bool silent = flags & AUDCLNT_BUFFERFLAGS_SILENT;
+                        size_t w = ring_w_.load(std::memory_order_relaxed);
+                        const size_t r = ring_r_.load(std::memory_order_acquire);
+                        for (UINT32 i = 0; i < n; ++i) {
+                            float l = 0, r_ch = 0;
+                            if (!silent) {
+                                l = sample_at(data, fmt, i, 0);
+                                r_ch = ch > 1 ? sample_at(data, fmt, i, 1) : l;
+                                if (ch >= 6 && !controller) {
+                                    float c = sample_at(data, fmt, i, 2), lfe = sample_at(data, fmt, i, 3);
+                                    l += 0.7f * c + 0.7f * lfe + 0.6f * sample_at(data, fmt, i, 4);
+                                    r_ch += 0.7f * c + 0.7f * lfe + 0.6f * sample_at(data, fmt, i, 5);
+                                }
+                            }
+                            while (rs_pos <= 1.0) {
+                                float sl = prev_l + (l - prev_l) * float(rs_pos), sr_s = prev_r + (r_ch - prev_r) * float(rs_pos);
+                                float hl, hr_s;
+                                conv.process(sl, sr_s, hl, hr_s);
+                                size_t nw = (w + 2) % rsz;
+                                if (nw != r) {          // strict SPSC: drop new sample if full, never write ring_r_
+                                    ring_[w] = hl;
+                                    ring_[w + 1] = hr_s;
+                                    w = nw;
+                                }
+                                rs_pos += step;
+                            }
+                            rs_pos -= 1.0;
+                            prev_l = l;
+                            prev_r = r_ch;
+                        }
+                        ring_w_.store(w, std::memory_order_release);
+                        cap->ReleaseBuffer(n);
+                        hr = cap->GetNextPacketSize(&packet);
+                    }
+                    if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+                        LOGW("game-audio layer: output device disconnected");
+                        break;
                     }
                 }
-                // resample to 48 kHz (linear) and convert
-                while (rs_pos <= 1.0) {
-                    float sl = prev_l + (l - prev_l) * float(rs_pos), sr = prev_r + (r - prev_r) * float(rs_pos);
-                    float hl, hr;
-                    conv.process(sl, sr, hl, hr);
-                    size_t w = ring_w_.load(), nw = (w + 2) % ring_.size();
-                    if (nw == ring_r_.load()) ring_r_ = (ring_r_.load() + 2) % ring_.size();   // overrun: drop oldest
-                    ring_[w] = hl;
-                    ring_[w + 1] = hr;
-                    ring_w_ = nw;
-                    rs_pos += step;
-                }
-                rs_pos -= 1.0;
-                prev_l = l;
-                prev_r = r;
+                client->Stop();
+                CoTaskMemFree(fmt);
             }
-            cap->ReleaseBuffer(n);
         }
-        // keep the layer close to real time (drop backlog over ~40 ms)
-        size_t w = ring_w_.load(), r = ring_r_.load();
-        size_t fill = (w + ring_.size() - r) % ring_.size();
-        if (fill > size_t(dsp::kSR * 0.04) * 2) ring_r_ = (w + ring_.size() - size_t(dsp::kSR * 0.015) * 2) % ring_.size();
     }
-    client->Stop();
-    CoTaskMemFree(fmt);
-    CoUninitialize();
+    if (SUCCEEDED(co)) CoUninitialize();
+    ga_running_ = false;
 }
 
 void AudioEngine::start_mic(float sens, std::function<void()> on_whistle) {
-    on_whistle_ = std::move(on_whistle);
+    std::lock_guard<std::mutex> l(restart_mu_);
+    {
+        std::lock_guard<std::mutex> ml(mu_);
+        on_whistle_ = std::move(on_whistle);
+    }
     cooldown_s_ = std::max(0.3f, config().num("Mic", "Cooldown", 1.2f));
+    mic_sens_ = sens;
+    if (mic_.joinable() && !mic_running_.load()) mic_.join();
     if (mic_.joinable()) return;
     mic_started_ = true;
-    mic_sens_ = sens;
-    mic_ = std::thread([this, sens] { mic_thread(sens); });
+    mic_running_ = true;
+    mic_ = std::thread([this] { mic_thread(mic_sens_.load()); });
+}
+
+void AudioEngine::stop_mic() {
+    std::lock_guard<std::mutex> l(restart_mu_);
+    mic_started_ = false;
+    mic_running_ = false;
+    if (mic_.joinable()) mic_.join();
+    mic_level_ = 0.0f;
 }
 
 // A whistle is a strong pure tone (500-4000 Hz) far above the rest of the spectrum, held ~0.15 s.
 void AudioEngine::mic_thread(float sens) {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    IMMDevice* dev = find_endpoint(eCapture, L"DualSense", L"");
-    if (!dev) {
-        LOGW("whistle: DualSense microphone not found");
-        CoUninitialize();
-        return;
-    }
-    ComPtr<IAudioClient> client;
-    ComPtr<IAudioCaptureClient> cap;
-    WAVEFORMATEX* fmt = nullptr;
-    bool good = SUCCEEDED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client)) &&
-                SUCCEEDED(client->GetMixFormat(&fmt)) &&
-                SUCCEEDED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 200000, 0, fmt, nullptr)) &&
-                SUCCEEDED(client->GetService(__uuidof(IAudioCaptureClient), (void**)&cap));
-    dev->Release();
-    if (!good) {
-        LOGE("whistle: could not open the microphone");
-        if (fmt) CoTaskMemFree(fmt);
-        CoUninitialize();
-        return;
-    }
-    LOGI("whistle detector on the controller mic (%d ch %lu Hz)", fmt->nChannels, fmt->nSamplesPerSec);
-    const int N = 1024;
-    const float sr = float(fmt->nSamplesPerSec);
-    std::vector<float> frame;
-    frame.reserve(N);
-    std::vector<std::complex<float>> spec(N);
-    int run = 0, misses = 0;
-    float low_bg = 0;                  // background energy 80-400 Hz (game sound, room)
-    float last_hz = 0;
-    double cooldown_until = 0;
-    std::vector<float> mags;
-    client->Start();
-    while (running_) {
-        Sleep(10);
-        UINT32 packet = 0;
-        while (SUCCEEDED(cap->GetNextPacketSize(&packet)) && packet) {
-            BYTE* data = nullptr;
-            UINT32 n = 0;
-            DWORD flags = 0;
-            if (FAILED(cap->GetBuffer(&data, &n, &flags, nullptr, nullptr))) break;
-            for (UINT32 i = 0; i < n; ++i) {
-                float s = 0;
-                if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
-                    for (int c = 0; c < fmt->nChannels; ++c) s += sample_at(data, fmt, i, c);
-                    s /= fmt->nChannels;
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    {
+        IMMDevice* dev = find_endpoint(eCapture, L"DualSense", L"");
+        if (!dev) {
+            LOGW("whistle: DualSense microphone not found");
+        } else {
+            ComPtr<IAudioClient> client;
+            ComPtr<IAudioCaptureClient> cap;
+            WAVEFORMATEX* fmt = nullptr;
+            bool good = SUCCEEDED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client)) &&
+                        SUCCEEDED(client->GetMixFormat(&fmt)) &&
+                        SUCCEEDED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 200000, 0, fmt, nullptr)) &&
+                        SUCCEEDED(client->GetService(__uuidof(IAudioCaptureClient), (void**)&cap));
+            dev->Release();
+            if (!good) {
+                LOGE("whistle: could not open the microphone");
+                if (fmt) CoTaskMemFree(fmt);
+            } else {
+                LOGI("whistle detector on the controller mic (%d ch %lu Hz)", fmt->nChannels, fmt->nSamplesPerSec);
+                const int N = 1024;
+                const float sr = float(fmt->nSamplesPerSec);
+                std::vector<float> hann(N);
+                for (int k = 0; k < N; ++k) hann[k] = 0.5f - 0.5f * std::cos(2 * kPi * k / (N - 1));
+                std::vector<float> frame;
+                frame.reserve(N);
+                std::vector<std::complex<float>> spec(N);
+                int run = 0, misses = 0;
+                float low_bg = 0;                  // background energy 80-400 Hz (game sound, room)
+                float last_hz = 0;
+                double cooldown_until = 0;
+                const int max_bin = N / 2 - 1;
+                const int band_lo = clampv(int(250 * N / sr), 1, max_bin);
+                const int band_hi = clampv(int(6000 * N / sr), band_lo + 1, N / 2);
+                const int lo = clampv(int(850 * N / sr), band_lo, band_hi - 1);
+                const int hi = clampv(int(4000 * N / sr), lo, band_hi - 1);
+                const int low_lo = clampv(int(80 * N / sr), 1, max_bin);
+                const int low_hi = clampv(int(400 * N / sr), low_lo + 1, N / 2);
+                std::vector<float> mags(size_t(band_hi - band_lo));
+                client->Start();
+                while (running_ && mic_running_) {
+                    Sleep(10);
+                    UINT32 packet = 0;
+                    HRESULT hr = cap->GetNextPacketSize(&packet);
+                    if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+                        LOGW("whistle: microphone disconnected");
+                        break;
+                    }
+                    while (SUCCEEDED(hr) && packet) {
+                        BYTE* data = nullptr;
+                        UINT32 n = 0;
+                        DWORD flags = 0;
+                        if (FAILED(cap->GetBuffer(&data, &n, &flags, nullptr, nullptr))) break;
+                        const bool listen = mic_listening_.load();
+                        if (!listen) {
+                            mic_level_ = 0.0f;
+                            frame.clear();
+                            run = misses = 0;
+                            cap->ReleaseBuffer(n);
+                            hr = cap->GetNextPacketSize(&packet);
+                            continue;
+                        }
+                        for (UINT32 i = 0; i < n; ++i) {
+                            float s = 0;
+                            if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+                                for (int c = 0; c < fmt->nChannels; ++c) s += sample_at(data, fmt, i, c);
+                                s /= fmt->nChannels;
+                            }
+                            frame.push_back(s);
+                            if (int(frame.size()) < N) continue;
+                            {
+                                float pk = 0;
+                                for (float v : frame) pk = std::max(pk, std::fabs(v));
+                                mic_level_ = pk;
+                            }
+                            for (int k = 0; k < N; ++k) spec[k] = {frame[k] * hann[k], 0.0f};
+                            frame.erase(frame.begin(), frame.begin() + N / 2);     // 50 % overlap
+                            dsp::fft(spec);
+                            int best = lo;
+                            float best_v = 0, total = 0;
+                            for (int k = band_lo; k < band_hi; ++k) {
+                                float v = std::abs(spec[k]);
+                                mags[size_t(k - band_lo)] = v;
+                                total += v * v;
+                                if (k >= lo && k <= hi && v > best_v) { best_v = v; best = k; }
+                            }
+                            float peak_e = 0;
+                            for (int k = std::max(band_lo, best - 2); k <= std::min(band_hi - 1, best + 2); ++k)
+                                peak_e += std::norm(spec[k]);
+                            float purity = peak_e / std::max(1e-12f, total);
+                            float low_e = 0;
+                            for (int k = low_lo; k < low_hi; ++k) low_e += std::norm(spec[k]);
+                            bool voiced = low_e > 4.0f * low_bg && low_e > 0.3f * peak_e;
+                            low_bg = low_bg <= 0 ? low_e : low_bg + (std::min(low_e, 3.0f * low_bg) - low_bg) * 0.02f;
+                            std::nth_element(mags.begin(), mags.begin() + mags.size() / 2, mags.end());
+                            float median = std::max(1e-7f, mags[mags.size() / 2]);
+                            float hz = best * sr / N;
+                            float level = best_v / (N / 4);
+                            float s_eff = std::max(0.3f, mic_sens_.load());
+                            bool tonal = best_v > median * (12.0f / s_eff) && level > 0.0025f / s_eff && purity > 0.55f / std::sqrt(s_eff) && !voiced;
+                            bool steady = last_hz <= 0 || std::fabs(hz - last_hz) / last_hz < 0.3f;
+                            if (tonal && steady) {
+                                ++run;
+                                misses = 0;
+                                last_hz = hz;
+                            } else if (run > 0 && ++misses <= 2) {
+                            } else {
+                                if (run >= 3 && run < int(0.15f * sr / (N / 2)))
+                                    LOGD("whistle candidate too short (%.0f Hz, %d frames)", last_hz, run);
+                                run = 0;
+                                misses = 0;
+                                last_hz = 0;
+                            }
+                            double t = now_s();
+                            float cd = cooldown_s_.load();
+                            if (run == int(0.15f * sr / (N / 2)) && t <= cooldown_until)
+                                LOGD("whistle heard again during the %.1f s cooldown (%.0f Hz)", cd, hz);
+                            if (run >= int(0.15f * sr / (N / 2)) && t > cooldown_until) {
+                                cooldown_until = t + cd;
+                                run = 0;
+                                LOGI("whistle detected (%.0f Hz)", hz);
+                                std::function<void()> cb;
+                                {
+                                    std::lock_guard<std::mutex> ml(mu_);
+                                    cb = on_whistle_;
+                                }
+                                if (cb) cb();
+                            }
+                        }
+                        cap->ReleaseBuffer(n);
+                        hr = cap->GetNextPacketSize(&packet);
+                    }
+                    if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+                        LOGW("whistle: microphone disconnected");
+                        break;
+                    }
                 }
-                frame.push_back(s);
-                if (int(frame.size()) < N) continue;
-                {
-                    float pk = 0;
-                    for (float v : frame) pk = std::max(pk, std::fabs(v));
-                    mic_level_ = pk;
-                }
-                for (int k = 0; k < N; ++k) {
-                    float w = 0.5f - 0.5f * std::cos(2 * kPi * k / (N - 1));
-                    spec[k] = {frame[k] * w, 0.0f};
-                }
-                frame.erase(frame.begin(), frame.begin() + N / 2);     // 50 % overlap
-                dsp::fft(spec);
-                // whistles: ~500-4000 Hz. Compare the peak with the MEDIAN of the band (robust: the
-                // whistle's own harmonics don't raise it), so low and soft whistles still stand out.
-                // whistles: ~850-4000 Hz (yours were 1.1-1.4 kHz). Voices and music in that range have
-                // their energy spread over many harmonics; a whistle puts almost all of it in one peak.
-                int lo = int(850 * N / sr), hi = int(4000 * N / sr), band_lo = int(250 * N / sr), band_hi = int(6000 * N / sr);
-                mags.resize(size_t(band_hi - band_lo));
-                int best = lo;
-                float best_v = 0, total = 0;
-                for (int k = band_lo; k < band_hi; ++k) {
-                    float v = std::abs(spec[k]);
-                    mags[size_t(k - band_lo)] = v;
-                    total += v * v;
-                    if (k >= lo && k <= hi && v > best_v) { best_v = v; best = k; }
-                }
-                float peak_e = 0;
-                for (int k = std::max(band_lo, best - 2); k <= std::min(band_hi - 1, best + 2); ++k)
-                    peak_e += std::norm(spec[k]);
-                float purity = peak_e / std::max(1e-12f, total);             // share of the energy in the peak
-                float low_e = 0;                                              // 80-400 Hz: a voice's own pitch
-                for (int k = int(80 * N / sr); k < int(400 * N / sr); ++k) low_e += std::norm(spec[k]);
-                bool voiced = low_e > 4.0f * low_bg && low_e > 0.3f * peak_e;   // a voice just started
-                low_bg = low_bg <= 0 ? low_e : low_bg + (std::min(low_e, 3.0f * low_bg) - low_bg) * 0.02f;
-                std::nth_element(mags.begin(), mags.begin() + mags.size() / 2, mags.end());
-                float median = std::max(1e-7f, mags[mags.size() / 2]);
-                float hz = best * sr / N;
-                float level = best_v / (N / 4);
-                float s_eff = std::max(0.3f, sens);
-                bool tonal = best_v > median * (12.0f / s_eff) && level > 0.0025f / s_eff && purity > 0.55f / std::sqrt(s_eff) && !voiced;
-                bool steady = last_hz <= 0 || std::fabs(hz - last_hz) / last_hz < 0.3f;   // whistles glide a bit
-                if (tonal && steady) {
-                    ++run;
-                    misses = 0;
-                    last_hz = hz;
-                } else if (run > 0 && ++misses <= 2) {
-                    // tolerate a dropped frame or two (breath, a wobble)
-                } else {
-                    if (run >= 3 && run < int(0.15f * sr / (N / 2)))
-                        LOGD("whistle candidate too short (%.0f Hz, %d frames)", last_hz, run);
-                    run = 0;
-                    misses = 0;
-                    last_hz = 0;
-                }
-                double t = now_s();
-                // ~0.15 s of steady tone
-                if (run == int(0.15f * sr / (N / 2)) && mic_listening_ && t <= cooldown_until)
-                    LOGD("whistle heard again during the %.1f s cooldown (%.0f Hz)", cooldown_s_, hz);
-                if (run >= int(0.15f * sr / (N / 2)) && t > cooldown_until && mic_listening_) {
-                    cooldown_until = t + cooldown_s_;
-                    run = 0;
-                    LOGI("whistle detected (%.0f Hz)", hz);
-                    if (on_whistle_) on_whistle_();
-                }
+                client->Stop();
+                CoTaskMemFree(fmt);
             }
-            cap->ReleaseBuffer(n);
         }
     }
-    client->Stop();
-    CoTaskMemFree(fmt);
-    CoUninitialize();
+    if (SUCCEEDED(co)) CoUninitialize();
+    mic_running_ = false;
 }
 
 }  // namespace dsr2

@@ -35,12 +35,14 @@ struct Page {
 void create_store() {
     page.root = DATABINDING_ADD_DATA_CONTAINER_FROM_PATH("", "DualSenseSettings");
     page.rows.clear();
+    if (!page.root) return;
     for (const MenuEntry& e : SettingsMenu::entries()) {
         if (e.kind == MenuEntry::Header) continue;
         // the data context of the row's stepper: value (two-way), prompt, enabled, visible, and
         //   levels  (our percent stepper = the game's list_item_int_stepper): minimum, maximum, step
         //   others  (list_item_option_stepper): options = text labels, value = index
         Hash h = DATABINDING_ADD_DATA_CONTAINER(page.root, e.id);
+        if (!h) continue;
         int v = SettingsMenu::page_value(e, config());
         if (e.kind == MenuEntry::Number) {
             DATABINDING_ADD_DATA_INT(h, "minimum", 0);
@@ -70,16 +72,16 @@ void settings_ui_tick(double /*now*/) {
         create_store();
         return;
     }
-    bool changed = false;
+    std::vector<std::tuple<std::string, std::string, std::string>> updates;
     for (PageRow& r : page.rows) {
+        if (!r.store || !DATABINDING_IS_ENTRY_VALID(r.store)) continue;
         const MenuEntry& e = *r.entry;
         int v = DATABINDING_READ_INT_FROM_PARENT(r.store, "value");
         if (v != r.shown) {                                   // the page changed it while the menu was open
             std::string val = SettingsMenu::page_ini(e, v);
             if (!val.empty()) {
-                config().set(e.section, e.key, val);
+                updates.emplace_back(e.section, e.key, val);
                 LOGI("settings page: %s.%s = %s", e.section, e.key, val.c_str());
-                changed = true;
             }
             r.shown = v;
             continue;
@@ -90,7 +92,9 @@ void settings_ui_tick(double /*now*/) {
             r.shown = want;
         }
     }
-    if (changed) core().request_reload();                    // effects pick the new values up at once
+    if (!updates.empty()) {
+        if (config().set_many(updates)) core().request_reload();
+    }
 }
 
 }  // namespace dsr2

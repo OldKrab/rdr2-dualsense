@@ -95,7 +95,9 @@ std::vector<std::string> tokens(const std::string& name) {
     size_t a = 0;
     for (size_t b; (b = name.find('_', a)) != std::string::npos; a = b + 1) t.push_back(name.substr(a, b - a));
     t.push_back(name.substr(a));
-    if (!t.empty() && !t.back().empty() && std::all_of(t.back().begin(), t.back().end(), ::isdigit)) t.pop_back();
+    if (!t.empty() && !t.back().empty() &&
+        std::all_of(t.back().begin(), t.back().end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; }))
+        t.pop_back();
     return t;
 }
 
@@ -174,32 +176,83 @@ void Surfaces::save() const {
     out << j.dump(2);
 }
 
+void Surfaces::start_worker() {
+    std::lock_guard<std::mutex> l(mu_);
+    if (shutting_down_ || worker_.joinable()) return;
+    stop_ = false;
+    worker_ = std::thread([this] {
+        for (;;) {
+            uint32_t m = 0;
+            {
+                std::unique_lock<std::mutex> l2(mu_);
+                cv_.wait(l2, [this] { return stop_ || !queue_.empty(); });
+                if (stop_) break;
+                m = queue_.front();
+                queue_.pop_front();
+            }
+            std::string n = identify(m);
+            std::string label = n.empty() ? "" : label_for(n);
+            LOGD("ground material 0x%08X = %s -> %s", m, n.empty() ? "(unknown)" : n.c_str(),
+                 n.empty() ? "context / F10" : label.c_str());
+            std::lock_guard<std::mutex> l2(mu_);
+            names_[m] = std::move(n);
+        }
+    });
+}
+
+void Surfaces::shutdown() {
+    std::thread w;
+    {
+        std::lock_guard<std::mutex> l(mu_);
+        stop_ = true;
+        shutting_down_ = true;
+        w = std::move(worker_);
+    }
+    cv_.notify_all();
+    if (w.joinable()) w.join();
+}
+
 std::string Surfaces::name_of(uint32_t m) const {
-    std::lock_guard<std::mutex> l(found_->mu);
-    auto it = found_->names.find(m);
-    return it == found_->names.end() ? "" : it->second;
+    std::lock_guard<std::mutex> l(mu_);
+    auto it = names_.find(m);
+    return it == names_.end() ? "" : it->second;
 }
 
 std::string Surfaces::classify(uint32_t m, bool indoors, float submerged, float snow) {
     if (submerged > 0.05f) return "water";
     auto it = taught_.find(m);
     if (it != taught_.end()) return it->second;
-    std::string name;
+    std::string label;
     if (m) {
-        if (asked_.insert(m).second) {
-            std::thread([found = found_, m] {
-                std::string n = identify(m);
-                std::string label = n.empty() ? "" : label_for(n);
-                LOGD("ground material 0x%08X = %s -> %s", m, n.empty() ? "(unknown)" : n.c_str(),
-                     n.empty() ? "context / F10" : label.c_str());
-                std::lock_guard<std::mutex> l(found->mu);
-                found->names[m] = n;
-            }).detach();
+        auto cit = label_cache_.find(m);
+        if (cit != label_cache_.end()) {
+            label = cit->second;
+        } else {
+            if (asked_.insert(m).second) {
+                start_worker();
+                {
+                    std::lock_guard<std::mutex> l(mu_);
+                    if (!shutting_down_) queue_.push_back(m);
+                }
+                cv_.notify_one();
+            }
+            bool ready = false;
+            std::string name;
+            {
+                std::lock_guard<std::mutex> l(mu_);
+                auto nit = names_.find(m);
+                if (nit != names_.end()) {
+                    ready = true;
+                    name = nit->second;
+                }
+            }
+            if (ready) {
+                bool generic = name.empty() || name.rfind("default_", 0) == 0 || name.rfind("generic_", 0) == 0;
+                label = generic ? "" : label_for(name);
+                label_cache_[m] = label;
+            }
         }
-        name = name_of(m);
     }
-    bool generic = name.empty() || name.rfind("default_", 0) == 0 || name.rfind("generic_", 0) == 0;
-    std::string label = generic ? "" : label_for(name);
     if (!indoors && snow > 0.3f && label != "wood" && label != "water") return "snow";
     if (!label.empty()) return label;
     if (indoors) return "wood";              // RDR2 interiors: almost always floorboards

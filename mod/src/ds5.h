@@ -32,6 +32,8 @@ struct InputState {
     uint32_t buttons = 0;
     int r2_feedback = 0, l2_feedback = 0, effect_state = 0;
     int battery = 0;               // 0-10
+    int battery_state = 0;         // 0 discharging, 1 charging, 2 full (high nibble of status[0])
+    bool charging() const { return battery_state == 1 || battery_state == 2; }
     bool headphones = false;       // something plugged into the controller's headphone jack
     int16_t gyro[3] = {0, 0, 0};   // pitch, yaw, roll  (~16 LSB per deg/s)
     int16_t accel[3] = {0, 0, 0};
@@ -51,6 +53,7 @@ struct OutputState {
     int player_leds = -1;          // 5-bit mask, -1 = leave alone
     int mute_led = -1;             // 0 off, 1 on, 2 pulse, -1 = leave alone
     int trigger_power_reduction = 0;
+    bool speaker_enabled = false;
 };
 
 class DualSense {
@@ -66,13 +69,22 @@ public:
     std::string name() const;
     // Bluetooth haptics: one report 0x32 with 64 bytes of audio (32 stereo frames, 3 kHz, 8 bit). Any thread.
     bool send_haptics(const uint8_t* pcm64);
+    // Exposed for unit testing of HID payload/CRC encoding.
+    static uint32_t bt_crc32(const uint8_t* data, size_t n);
+    void encode_payload(const OutputState& o, uint8_t* p) { build_payload(o, p); }
 
 private:
+    struct GyroCal {
+        bool valid = false;
+        float bias[3] = {0, 0, 0};
+        float scale[3] = {1, 1, 1};  // maps raw LSB -> normalized 16.4 LSB/(deg/s)
+    };
     void loop();
     bool open();
     void close();
     bool write(const OutputState& o, bool force);
     void build_payload(const OutputState& o, uint8_t* p);
+    void parse_calibration(const uint8_t* feat);
 
     Handler handler_;
     std::thread thread_;
@@ -80,7 +92,7 @@ private:
     std::atomic<float> rate_{0};
     HANDLE dev_ = INVALID_HANDLE_VALUE;
     HANDLE read_ev_ = nullptr, write_ev_ = nullptr, hap_ev_ = nullptr;
-    std::mutex dev_mu_;                  // dev_ while another thread (Bluetooth haptics) writes to it
+    mutable std::mutex dev_mu_;          // protects dev_, name_, write_buf_, hap_buf_
     uint8_t hap_counter_ = 0;
     size_t in_len_ = 64, out_len_ = 48;
     uint8_t bt_seq_ = 0;
@@ -89,7 +101,8 @@ private:
     // starts on the jack even with nothing plugged in, so the speaker stays silent until we route it.
     int routed_ = -1, routing_ = -1;
     bool headphones_ = false;
-    std::vector<uint8_t> last_payload_;
+    GyroCal gyro_cal_;
+    std::vector<uint8_t> last_payload_, write_buf_, hap_buf_;
     InputState last_;
     std::string name_;
 };

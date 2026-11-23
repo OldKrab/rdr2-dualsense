@@ -20,10 +20,17 @@ void Core::load_data() {
     Config& c = config();
     c.load((module_dir() / "DualSenseRDR2.ini").wstring());
     log::set_debug(c.flag("General", "Debug", false));
+    reload_key_ = c.integer("General", "ReloadKey", 120);
+    wheel_click_gain_ = c.num("Haptics", "WheelClick", 0.6f);
     triggers_on_ = c.flag("Triggers", "Enabled", true);
     haptics_on_ = c.flag("Haptics", "Enabled", true);
     record_cues_ = log::debug_enabled() && c.flag("General", "Record", false);
+    const bool spk_on = c.flag("Speaker", "Mechanics", false) && haptics_on_;
     speaker_mechanics_ = c.flag("Speaker", "Mechanics", false);
+    speaker_ambient_ = c.flag("Speaker", "Ambient", true);
+    speaker_ui_ = c.flag("Speaker", "UI", true);
+    const float spk_vol = spk_on ? c.num("Speaker", "Volume", 0.35f) : 0.0f;
+    LOGI("speaker: %s (volume %.2f)", spk_on ? "on" : "off", spk_vol);
     settings_ = Settings{};
     settings_.manual_action = c.flag("Triggers", "ManualCocking", true);
     settings_.fanning = c.flag("Triggers", "Fanning", true);
@@ -45,7 +52,7 @@ void Core::load_data() {
     features_.configure();
     input().configure();
     audio_.set_strength(c.num("Haptics", "Strength", 1.0f));
-    audio_.set_speaker_volume(c.num("Speaker", "Volume", 0.35f));
+    audio_.set_speaker_volume(spk_vol);
     audio_.set_duck(c.num("Haptics", "Duck", 0.3f));
     audio_.set_rumble_gain(c.num("Haptics", "GameRumble", 0.15f));
     // Bluetooth: haptics as audio in the controller's reports (Bluetooth=0: the rumble motors instead). The sample
@@ -59,14 +66,18 @@ void Core::load_data() {
 }
 
 bool Core::init(bool in_game, const std::string& test_weapon) {
+    shutting_down_ = false;
     in_game_ = in_game;
     test_weapon_ = test_weapon;
     load_data();
     Config& c = config();
     if (!c.flag("General", "Enabled", true)) {
+        enabled_ = false;
+        initialized_ = true;
         LOGI("disabled in DualSenseRDR2.ini");
         return false;
     }
+    enabled_ = true;
     if (in_game) input().install_hook();
     audio_.set_bluetooth_output([this](const uint8_t* pcm) { return pad_.send_haptics(pcm); },
                                 [this] { return pad_.connected() && !pad_.usb(); });
@@ -75,6 +86,7 @@ bool Core::init(bool in_game, const std::string& test_weapon) {
     audio_.start_game_audio(c.num("Haptics", "GameAudio", 0.0f), c.str("Haptics", "GameAudioDevice", ""));
     apply_mic();
     pad_.start([this](const InputState& s, OutputState& out) { return on_input(s, out); });
+    initialized_ = true;
     LOGI("started (%s)", in_game ? "in game" : "standalone test");
     return true;
 }
@@ -86,6 +98,8 @@ void Core::apply_mic() {
     whistle_on_ = c.flag("Mic", "WhistleForHorse", false);
     if (whistle_on_)
         audio_.start_mic(c.num("Mic", "Sensitivity", 1.0f), [this] { whistle_at_ = now_s(); });   // acted on in on_input
+    else
+        audio_.stop_mic();
     // each command may list several spellings/words, comma separated: chao = ciao / chow
     auto words = [&](const char* key, const char* def) {
         std::vector<std::string> out;
@@ -142,6 +156,7 @@ void Core::load_game_files() {
 
 // "heard you": two firm thumps and a short lightbar flash
 void Core::confirm() {
+    if (!haptics_on_) return;
     Cue ack;
     ack.name = "whistle_ack";
     ack.gain = config().num("Mic", "Confirm", 1.0f);
@@ -151,17 +166,28 @@ void Core::confirm() {
 }
 
 void Core::shutdown() {
+    shutting_down_ = true;
+    {
+        std::lock_guard<std::mutex> l(reconnect_mu_);
+        if (reconnect_thread_.joinable()) reconnect_thread_.join();
+    }
     pad_.stop();
     voice_.stop();
     dialogue().stop();
     audio_.stop();
+    world().shutdown();
+    initialized_ = false;
+    enabled_ = false;
     LOGI("stopped");
 }
 
 void Core::build_engine(const nlohmann::json& prof0, const std::string& name) {
     if (engine_) learned_break_[engine_->id()] = engine_->break_raw();
     engine_.reset();
-    engine_name_ = name;
+    {
+        std::lock_guard<std::mutex> l(status_mu_);
+        engine_name_ = name;
+    }
     if (prof0.is_null()) return;
     nlohmann::json prof = prof0;
     std::string shot = lib_.ensure_weapon(prof);
@@ -196,20 +222,20 @@ bool Core::on_input(const InputState& s, OutputState& out) {
     // A stale picture must not keep anything going (the gait rhythm galloped on in the pause menu): treat it as
     // halted, mute the game-clock tracks (dialogue) and the game's rumble until it moves again.
     const bool frozen = in_game_ && g.valid && s.t - g.time > 0.25;
+    const bool in_menu = in_game_ && (!g.valid || g.menu || frozen);
     if (frozen) {
         g.halted = true;
         g.blocked = true;
     }
-    audio_.set_tracks_muted(frozen);
+    audio_.set_tracks_muted(frozen || in_menu);
 
     // a whistle is acted on at once - unless the speech recognizer has just heard / guessed a command ("chao")
-    double wt = whistle_at_.load();
+    double wt = whistle_at_.exchange(-1);
     if (wt > 0) {
-        whistle_at_ = -1;
         double ct = std::max(last_command_t_.load(), voice_.last_command_guess.load());
         bool playing = !in_game_ || (g.valid && !g.blocked && !g.menu && !g.wheel);
         if (!whistle_on_) {
-            // switched off (settings page / ini) - the detector keeps running until the game restarts
+            // switched off
         } else if (ct > wt - 1.0 && ct <= wt + 0.05) {
             LOGI("whistle ignored: it was a spoken word");
         } else if (!playing) {
@@ -224,11 +250,15 @@ bool Core::on_input(const InputState& s, OutputState& out) {
         }
     }
 
-    // which weapon is in hand
+    // which weapon is in hand (when unarmed on a horse or in a vehicle, R1/Circle are horse brake/calm - never run unarmed fist melee!)
     uint32_t key = 0;
     if (in_game_) {
-        if (frozen) key = engine_key_;             // paused: the same gun (not rebuilt), just inactive
-        else if (g.valid && !g.blocked && g.weapon) key = g.weapon;
+        if (frozen) {
+            key = engine_key_;             // paused: the same gun (not rebuilt), just inactive
+        } else if (g.valid && !g.blocked && g.weapon) {
+            const bool riding_unarmed = !g.armed && (g.on_mount || g.in_vehicle || g.in_train || g.in_boat);
+            if (!riding_unarmed) key = g.weapon;
+        }
     } else if (!test_weapon_.empty()) {
         key = joaat(test_weapon_);
     }
@@ -259,6 +289,7 @@ bool Core::on_input(const InputState& s, OutputState& out) {
         h.lasso_attached = g.lasso_attached;
         h.lasso_pull = g.lasso_pull;
         h.melee_hits = g.melee_hits;
+        h.melee_ko = g.melee_ko;
         h.melee_target_near = g.melee_target_near;
         h.hip_fire = !g.aiming;
         h.dual_wield = g.dual_wield;
@@ -267,31 +298,43 @@ bool Core::on_input(const InputState& s, OutputState& out) {
         h.deadeye_marks = g.deadeye_marks;
     }
     // weapon / item wheel: L2/R2 switch weapons there - not shots. Pause the trigger engine while it is
-    // open (L1 held, or the game says so) and until R2 has been let go afterwards.
-    if (s.pressed(L1)) { if (l1_since_ < 0) l1_since_ = s.t; } else l1_since_ = -1;
-    bool wheel = (l1_since_ >= 0 && s.t - l1_since_ > 0.12) || (in_game_ && g.wheel);
+    // open (L1 held, or the game says so) and until R2 has been let go afterwards, never in menus/loading.
+    const bool allow_wheel = !in_menu && (!in_game_ || !g.blocked || g.wheel);
+    if (allow_wheel && s.pressed(L1)) { if (l1_since_ < 0) l1_since_ = s.t; } else l1_since_ = -1;
+    bool wheel = allow_wheel && ((l1_since_ >= 0 && s.t - l1_since_ > 0.12) || (in_game_ && g.wheel));
     if (wheel) { wheel_until_ = s.t + 0.25; need_r2_release_ = true; }
+    else if (!allow_wheel) { wheel_until_ = 0; need_r2_release_ = false; }
+    else if (wheel_open_ && in_game_ && !g.wheel) { wheel_until_ = 0; }      // game closed wheel: weapon ready immediately
     if (need_r2_release_ && s.t > wheel_until_ && s.r2 < 25) need_r2_release_ = false;
     bool paused = s.t < wheel_until_ || need_r2_release_;
     EngineFrame frame;
-    bool weapon_active = engine_ && triggers_on_ && !paused && !(in_game_ && (g.blocked || g.swimming));
-    if (engine_ && !paused) frame = engine_->update(s, h);
-    std::vector<Cue> cues = frame.cues;
+    const uint32_t pressed = s.buttons & ~prev_buttons_;
+    prev_buttons_ = s.buttons;
+    bool can_run_engine = engine_ && !paused && !frozen && !(in_game_ && (g.blocked || g.swimming));
+    bool weapon_active = can_run_engine && triggers_on_;
+    if (can_run_engine) frame = engine_->update(s, h);
+    std::vector<Cue> cues = std::move(frame.cues);
     if (weapon_active) {
         out.r2 = frame.r2;
         out.l2 = frame.l2;
     }
     features_.update(s, g, std::move(events), engine_ ? &frame : nullptr, weapon_active,
                      engine_ ? engine_->clip() : -1, engine_ ? engine_->clip_size() : 0, audio_.mic_listening(), out, cues);
+    // Keep adaptive triggers relaxed and suppress haptics in main menus, pause menus, and loading screens.
+    if (in_menu) {
+        out.r2 = fx::off();
+        out.l2 = fx::off();
+        cues.clear();
+    }
     // in the wheel L2/R2 browse weapons: each press is a light selector click (a detent that gives way),
     // with a small tick - a switch, not a shot. After closing it R2 stays loose until let go.
-    if (s.t < wheel_until_ && triggers_on_) {
+    if (!in_menu && s.t < wheel_until_ && triggers_on_) {
         out.r2 = fx::weapon(2, 4, 3);
         out.l2 = fx::weapon(2, 4, 3);
         int click_r = cal_.raw_at(4, true), click_l = cal_.raw_at(4, false);
         Cue tick;
         tick.name = "wheel_tick";
-        tick.gain = config().num("Haptics", "WheelClick", 0.6f);
+        tick.gain = wheel_click_gain_.load();
         tick.has_pan = true;
         if (tick.gain > 0 && s.r2 >= click_r && wheel_r2_ < click_r) { tick.pan = 0.6f; cues.push_back(tick); }
         if (tick.gain > 0 && s.l2 >= click_l && wheel_l2_ < click_l) { tick.pan = -0.6f; cues.push_back(tick); }
@@ -302,7 +345,7 @@ bool Core::on_input(const InputState& s, OutputState& out) {
         }
     }
     wheel_item_ = in_game_ ? g.wheel_item : 0;
-    wheel_open_ = in_game_ && g.wheel;
+    wheel_open_ = in_game_ && g.wheel && !in_menu;
     wheel_r2_ = s.r2;
     wheel_l2_ = s.l2;
     if (!g.valid && !in_game_ && engine_) {        // standalone: engine state on the lightbar
@@ -318,9 +361,23 @@ bool Core::on_input(const InputState& s, OutputState& out) {
         out.has_lightbar = true;
         out.r = 40; out.g = 160; out.b = 255;
     }
-    // "Sounds from the Controller" Off: no effect plays on the speaker - the weapon's clicks and the lasso rope, and the
-    // gun draw / holster sounds Features adds (those slipped past when this ran before Features)
-    for (auto& c : cues) c.speaker = c.speaker && speaker_mechanics_;
+    // Route controller speaker output by category when "Sounds from the Controller" is active.
+    const bool spk_on = speaker_mechanics_.load() && haptics_on_;
+    out.speaker_enabled = spk_on;
+    for (auto& c : cues) {
+        if (!spk_on) {
+            c.speaker = false;
+            continue;
+        }
+        switch (HapticLibrary::speaker_category(c.name)) {
+        case SpeakerCategory::Mech:
+            if (c.name != "gun_draw" && c.name != "gun_holster") c.speaker = true;
+            break;
+        case SpeakerCategory::Ambient: c.speaker = speaker_ambient_.load(); break;
+        case SpeakerCategory::UI: c.speaker = speaker_ui_.load(); break;
+        case SpeakerCategory::None: c.speaker = false; break;
+        }
+    }
     // Contrast (Returnal: the heaviest feel is kept for the greatest threats): while shots fly and hits land - ours,
     // others' or an explosion - the everyday textures (steps, hooves, wading, bushes, rain, wheels) step back
     bool fight = frame.flash;
@@ -382,9 +439,12 @@ bool Core::on_input(const InputState& s, OutputState& out) {
     }
     if (s.fresh) {
         input().track_touch(s);
-        input().track_gyro(s, in_game_ ? (g.free_aim && !g.lock_on && !g.blocked && !paused) : s.l2 > 128);
+        const bool real_weapon_aim = in_game_ ? (g.valid && g.armed && g.free_aim && !g.lock_on && !g.blocked && !paused)
+                                              : (s.l2 > 128);
+        const bool can_gyro = !in_game_ || (g.valid && !g.blocked && !paused && !in_menu);
+        input().track_gyro(s, real_weapon_aim, can_gyro);
     }
-    if (paused || frozen) audio_.set_rumble(0, 0);       // the game rumbles while you browse the wheel
+    if (paused || frozen || in_menu) audio_.set_rumble(0, 0);   // mute game rumble in wheel/menus/loading
     else audio_.set_rumble(input().rumble_low(), input().rumble_high());
     if (!audio_.ok() && haptics_on_) {
         out.has_rumble = true;
@@ -400,8 +460,6 @@ bool Core::on_input(const InputState& s, OutputState& out) {
             }
         }
     }
-    uint32_t pressed = s.buttons & ~prev_buttons_;
-    prev_buttons_ = s.buttons;
     // hold PS ~1 s: reload the ini and the data, like F9 (the game never sees the PS button)
     if (s.buttons & PS) {
         if (ps_since_ < 0) ps_since_ = s.t;
@@ -428,6 +486,7 @@ bool Core::on_input(const InputState& s, OutputState& out) {
 }
 
 void Core::script_tick() {
+    if (!initialized_.load() || !enabled_.load()) return;
     if (in_game_) {
         // perf probe (debug log only): game FPS and how long our per-frame work takes, once a second
         double t0 = now_s();
@@ -452,20 +511,22 @@ void Core::script_tick() {
     if (!pad_.connected()) input().publish(InputState{}, -1, false);   // let other pads through
     // the controller came back (cable, Bluetooth, sleep): Windows recreated its audio devices
     bool conn = pad_.connected();
-    if (conn && !pad_was_connected_ && (pad_seen_ || !audio_.ok()) && !restarting_.exchange(true)) {
+    if (conn && !pad_was_connected_ && (pad_seen_ || !audio_.ok()) && !shutting_down_.load() && !restarting_.exchange(true)) {
         LOGI("controller %s - reopening its audio (haptics, mic, voice)", pad_seen_ ? "reconnected" : "connected after the game started");
-        std::thread([this] {
-            Sleep(1500);                      // give Windows a moment to publish the new endpoints
-            audio_.restart();
-            voice_.restart();
+        std::lock_guard<std::mutex> l(reconnect_mu_);
+        if (reconnect_thread_.joinable()) reconnect_thread_.join();
+        reconnect_thread_ = std::thread([this] {
+            for (int i = 0; i < 30 && !shutting_down_.load(); ++i) Sleep(50);
+            if (!shutting_down_.load()) {
+                audio_.restart();
+                voice_.restart();
+            }
             restarting_ = false;
-        }).detach();
+        });
     }
-    // (a late controller is made known to the game in on_input - gamemem::mark_pad_slot. Not by re-sending Windows'
-    // "devices changed" message: the game's window then re-checks the display too - the desktop flashed for a moment)
     if (conn) pad_seen_ = true;
     pad_was_connected_ = conn;
-    int key = config().integer("General", "ReloadKey", 120);
+    int key = reload_key_.load();
     bool down = (GetAsyncKeyState(key) & 0x8000) != 0;
     if (down && !reload_key_down_) request_reload();
     reload_key_down_ = down;

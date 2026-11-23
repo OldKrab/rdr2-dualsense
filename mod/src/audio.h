@@ -30,7 +30,7 @@ public:
 
     void play(const Cue& c);                           // haptic (+ speaker if c.speaker)
     void set_strength(float g) { strength_ = g; }
-    void set_speaker_volume(float v) { speaker_vol_ = v; }
+    void set_speaker_volume(float v);
     void set_duck(float d) { duck_level_ = d; }
     // the game's own rumble (XInputSetState), 0..1 per motor
     void set_rumble(float low, float high) { rumble_low_ = low; rumble_high_ = high; }
@@ -40,6 +40,7 @@ public:
     void set_game_audio_gain(float g) { game_audio_gain_ = g; }
     // whistle detector on the controller mic
     void start_mic(float sensitivity, std::function<void()> on_whistle);
+    void stop_mic();
     void set_mic_listening(bool on) { mic_listening_ = on; }
     bool mic_listening() const { return mic_listening_.load(); }
     bool scripted_active() const { return scripted_active_.load(); }
@@ -85,6 +86,8 @@ private:
     struct Track {
         std::shared_ptr<const std::vector<float>> mono;
         double t0 = 0;
+        long long pos = 0;
+        bool pos_init = false;
         float gl = 1, gr = 1;           // target gains
         float cl = 0, cr = 0;           // current (smoothed: moves and fades never click)
         bool stopping = false;
@@ -101,7 +104,8 @@ private:
 
     HapticLibrary* lib_ = nullptr;
     std::thread render_, loop_, mic_;
-    std::atomic<bool> running_{false}, ok_{false}, mic_listening_{true}, scripted_active_{false}, tracks_muted_{false};
+    std::atomic<bool> running_{false}, mic_running_{false}, ga_running_{false}, ok_{false}, mic_listening_{true}, scripted_active_{false},
+                      tracks_muted_{false}, purge_speaker_{false};
     std::atomic<float> latency_ms_{0}, strength_{1}, speaker_vol_{0.35f}, duck_level_{0.3f};
     std::atomic<float> rumble_low_{0}, rumble_high_{0}, rumble_gain_{0.6f}, game_audio_gain_{0.45f};
     std::mutex mu_;
@@ -112,12 +116,11 @@ private:
     std::atomic<size_t> ring_w_{0}, ring_r_{0};
     std::function<void()> on_whistle_;
     std::atomic<float> mic_level_{0};
-    float cooldown_s_ = 1.2f;
+    std::atomic<float> cooldown_s_{1.2f}, mic_sens_{1.0f};
   public:
     // a recognition happened: the controller thread flashes the lightbar until this time
     std::atomic<double> ack_flash_until{0};
   private:
-    float mic_sens_ = 1.0f, ga_gain_ = 0;
     std::string ga_hint_;
     bool mic_started_ = false, ga_started_ = false;
     std::mutex restart_mu_;

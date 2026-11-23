@@ -25,6 +25,7 @@ void HapticLibrary::load(const fs::path& recipes_json, GameAudio* game) {
     std::lock_guard<std::recursive_mutex> l(mu_);
     game_ = game;
     buffers_.clear();
+    speaker_cache_.clear();
     kicks_.clear();
     source_.clear();
     std::ifstream in(recipes_json);
@@ -47,12 +48,12 @@ void HapticLibrary::load(const fs::path& recipes_json, GameAudio* game) {
     LOGI("haptics: %d recipes", n);
 }
 
-Stereo HapticLibrary::synth_layer(const json& L, float fm, int variant) {
+Stereo HapticLibrary::synth_layer(const json& L, float fm, int variant, bool audible) {
     const std::string type = L.value("type", "");
     float amp = jf(L, "amp", 1.0f);
     std::vector<float> mono;
     if (type == "click") {
-        float hz = jf(L, "hz", 250) * fm, cycles = jf(L, "cycles", 1);
+        float hz = clampv(jf(L, "hz", 250) * fm, 10.0f, dsp::kSR * 0.45f), cycles = std::max(0.25f, jf(L, "cycles", 1));
         int n = std::max(2, int(dsp::kSR * cycles / hz));
         mono.resize(n);
         for (int i = 0; i < n; ++i) {
@@ -60,8 +61,14 @@ Stereo HapticLibrary::synth_layer(const json& L, float fm, int variant) {
             mono[i] = std::sin(2 * kPi * hz * i / dsp::kSR) * w * amp;
         }
     } else if (type == "tone") {
-        float hz0 = jf(L, "hz", 60) * fm, hz1 = jf(L, "to_hz", hz0 / fm) * fm;
+        float hz0 = clampv(jf(L, "hz", 60) * fm, 5.0f, dsp::kSR * 0.45f);
+        float hz1 = clampv(jf(L, "to_hz", hz0 / fm) * fm, 5.0f, dsp::kSR * 0.45f);
         float att = jf(L, "attack_ms", 1) / 1000, dec = std::max(1e-4f, jf(L, "decay_ms", 50) / 1000);
+        if (audible) {
+            // On the tiny speaker, long haptic sine tones sound like electronic beeps; keep them as short, dry knocks
+            att = std::min(att, 0.004f);
+            dec = std::min(dec, 0.022f);
+        }
         int n = int(dsp::kSR * (att + 5 * dec));
         mono.resize(n);
         float phase = 0;
@@ -73,8 +80,14 @@ Stereo HapticLibrary::synth_layer(const json& L, float fm, int variant) {
             mono[i] = std::sin(phase) * env * amp;
         }
     } else if (type == "noise") {
-        float lo = jf(L, "lo", 60) * fm, hi = std::min(20000.0f, jf(L, "hi", 300) * fm);
+        float lo = clampv(jf(L, "lo", 60) * fm, 5.0f, dsp::kSR * 0.40f);
+        float hi = clampv(jf(L, "hi", 300) * fm, lo + 10.0f, dsp::kSR * 0.45f);
         float att = jf(L, "attack_ms", 0.5f) / 1000, dec = std::max(1e-4f, jf(L, "decay_ms", 30) / 1000);
+        if (audible) {
+            // Long bandpass noise bursts sound like a salt shaker on the speaker; clamp to crisp mechanical friction
+            att = std::min(att, 0.003f);
+            dec = std::min(dec, 0.016f);
+        }
         int n = int(dsp::kSR * (att + 5 * dec));
         Rng r((uint64_t(jf(L, "seed", 7)) + uint64_t(variant) * 101) * 7919 + 1);   // each variant its own grain
         dsp::Band band(lo, hi);
@@ -104,9 +117,9 @@ Stereo HapticLibrary::synth_layer(const json& L, float fm, int variant) {
     return out;
 }
 
-const std::vector<Stereo>& HapticLibrary::render_recipe(const std::string& name, int depth, bool audible) {
-    const std::string key = audible ? name + "#spk" : name;
-    const float fm = audible ? 6.0f : 1.0f;
+const std::vector<Stereo>& HapticLibrary::render_recipe(const std::string& name, int depth, bool audible, float audible_fm) {
+    const std::string key = audible ? name + "#spk" + std::to_string(int(std::lround(audible_fm * 10.0f))) : name;
+    const float fm = audible ? audible_fm : 1.0f;
     auto it = buffers_.find(key);
     if (it != buffers_.end()) return it->second;
     if (depth > 4) throw std::runtime_error("references nest too deep");
@@ -115,7 +128,7 @@ const std::vector<Stereo>& HapticLibrary::render_recipe(const std::string& name,
     // "variants": N - N takes of a synthesized recipe (each its own noise grain, pitch a few % apart), one picked per
     // play: no two steps on the same ground feel identical
     static const float kJitter[8] = {1.0f, 0.96f, 1.04f, 0.98f, 1.03f, 0.95f, 1.05f, 1.01f};
-    const int nvar = audible ? 1 : std::clamp(r.value("variants", 1), 1, 8);
+    const int nvar = audible ? std::clamp(r.value("variants", 1), 1, 4) : std::clamp(r.value("variants", 1), 1, 8);
     std::vector<Stereo> statics(static_cast<size_t>(nvar));
     std::vector<std::vector<Stereo>> variant_layers;
     std::string src = "synth";
@@ -139,14 +152,14 @@ const std::vector<Stereo>& HapticLibrary::render_recipe(const std::string& name,
                 variant_layers.push_back(std::move(vs));
             } else if (r.contains("fallback")) {
                 for (const auto& F : r["fallback"])
-                    for (int v = 0; v < nvar; ++v) place(statics[v], synth_layer(F, fm * kJitter[v], v), 0);
+                    for (int v = 0; v < nvar; ++v) place(statics[v], synth_layer(F, fm * kJitter[v], v, audible), 0);
             }
         } else if (type == "ref") {
-            const auto& ref = render_recipe(L.value("name", ""), depth + 1, audible);
+            const auto& ref = render_recipe(L.value("name", ""), depth + 1, audible, audible_fm);
             for (int v = 0; v < nvar && !ref.empty(); ++v)
                 place(statics[v], ref[size_t(v) % ref.size()], jf(L, "delay_ms", 0), jf(L, "amp", 1));
         } else {
-            for (int v = 0; v < nvar; ++v) place(statics[v], synth_layer(L, fm * kJitter[v], v), 0);
+            for (int v = 0; v < nvar; ++v) place(statics[v], synth_layer(L, fm * kJitter[v], v, audible), 0);
         }
     }
     float gain = jf(r, "gain", 1);
@@ -192,7 +205,11 @@ std::vector<std::vector<int>> HapticLibrary::kicks(const std::string& name) {
 
 static void respeed(const Stereo& in, float speed, Stereo& out) {
     size_t frames = in.size() / 2;
-    size_t n = size_t(frames / speed);
+    if (frames == 0 || speed <= 1e-4f || !std::isfinite(speed)) {
+        out.clear();
+        return;
+    }
+    size_t n = std::max<size_t>(1, size_t(frames / speed));
     out.resize(n * 2);
     for (size_t i = 0; i < n; ++i) {
         float p = i * speed;
@@ -266,49 +283,110 @@ std::string HapticLibrary::ensure_weapon(const json& prof) {
     return name;
 }
 
-// cue name -> sound role a user can label on the lab's Sounds page
-static std::string speaker_role(const std::string& cue) {
-    static const std::map<std::string, std::string> m = {
-        {"hammer_cock", "cock"}, {"hammer_cock_auto", "cock"}, {"lever_open", "lever_open"},
-        {"lever_open_big", "lever_open"}, {"lever_close", "lever_close"}, {"lever_close_big", "lever_close"},
-        {"bolt_open", "bolt_open"}, {"bolt_close", "bolt_close"}, {"pump_back", "pump_back"},
-        {"pump_forward", "pump_forward"}, {"slide_small_back", "pump_back"}, {"slide_small_forward", "pump_forward"},
-        {"reload_round", "reload"}, {"reload_shell", "reload"}, {"stripper_clip", "reload"}, {"mag_in", "reload"},
-        {"dry_fire", "dry_fire"}, {"breech_open", "reload"}, {"breech_close", "reload"}, {"cylinder_gate", "reload"},
-        // real game recordings found by name (tools/awc/autolabel.py)
-        {"gun_draw", "draw"}, {"gun_holster", "holster"}, {"lasso_throw", "lasso_throw"},
-        {"rope_jerk", "rope_jerk"}, {"rope_catch", "rope_jerk"},
+struct SpeakerSpec {
+    SpeakerCategory cat = SpeakerCategory::None;
+    const char* role = "";
+    float fm = 6.0f;
+    float gain = 1.0f;
+};
+
+// Cue name -> speaker routing, optional game-audio role, pitch multiplier and balance.
+static const SpeakerSpec& speaker_spec(const std::string& cue) {
+    using C = SpeakerCategory;
+    static const SpeakerSpec kNone{};
+    static const std::map<std::string, SpeakerSpec> m = {
+        // --- Mech: real RDR2 recordings + crisp weapon/reel mechanical clicks ---
+        {"gun_draw", {C::Mech, "draw", 5.5f, 0.90f}},
+        {"gun_holster", {C::Mech, "holster", 5.5f, 0.90f}},
+        {"lasso_throw", {C::Mech, "lasso_throw", 5.5f, 0.90f}},
+        {"rope_jerk", {C::Mech, "rope_jerk", 5.0f, 0.90f}},
+        {"rope_catch", {C::Mech, "rope_jerk", 5.0f, 0.90f}},
+        {"bow_creak", {C::Mech, "rope_creak", 4.5f, 0.65f}},
+        {"hammer_cock", {C::Mech, "cock", 6.0f, 0.95f}},
+        {"hammer_cock_auto", {C::Mech, "cock", 6.0f, 0.95f}},
+        {"lever_open", {C::Mech, "lever_open", 6.0f, 0.95f}},
+        {"lever_open_big", {C::Mech, "lever_open", 6.0f, 0.95f}},
+        {"lever_close", {C::Mech, "lever_close", 6.0f, 0.95f}},
+        {"lever_close_big", {C::Mech, "lever_close", 6.0f, 0.95f}},
+        {"lever_cycle", {C::Mech, "lever_close", 6.0f, 0.95f}},
+        {"lever_cycle_big", {C::Mech, "lever_close", 6.0f, 0.95f}},
+        {"bolt_open", {C::Mech, "bolt_open", 6.0f, 0.95f}},
+        {"bolt_close", {C::Mech, "bolt_close", 6.0f, 0.95f}},
+        {"bolt_cycle", {C::Mech, "bolt_close", 6.0f, 0.95f}},
+        {"pump_back", {C::Mech, "pump_back", 6.0f, 0.95f}},
+        {"slide_small_back", {C::Mech, "pump_back", 6.0f, 0.95f}},
+        {"pump_forward", {C::Mech, "pump_forward", 6.0f, 0.95f}},
+        {"slide_small_forward", {C::Mech, "pump_forward", 6.0f, 0.95f}},
+        {"pump_cycle", {C::Mech, "pump_forward", 6.0f, 0.95f}},
+        {"slide_small_cycle", {C::Mech, "pump_forward", 6.0f, 0.95f}},
+        {"reload_round", {C::Mech, "reload", 6.0f, 0.95f}},
+        {"reload_shell", {C::Mech, "reload", 6.0f, 0.95f}},
+        {"stripper_clip", {C::Mech, "reload", 6.0f, 0.95f}},
+        {"mag_in", {C::Mech, "reload", 6.0f, 0.95f}},
+        {"mag_out", {C::Mech, "reload", 6.0f, 0.95f}},
+        {"slide_release", {C::Mech, "reload", 6.0f, 0.95f}},
+        {"topbreak_open", {C::Mech, "reload", 6.0f, 0.95f}},
+        {"topbreak_close", {C::Mech, "reload", 6.0f, 0.95f}},
+        {"breech_open", {C::Mech, "reload", 6.0f, 0.95f}},
+        {"breech_close", {C::Mech, "reload", 6.0f, 0.95f}},
+        {"cylinder_gate", {C::Mech, "reload", 6.0f, 0.95f}},
+        {"dry_fire", {C::Mech, "dry_fire", 6.5f, 1.00f}},
+        {"reel_click", {C::Mech, "", 7.5f, 0.50f}},
+        {"impact_blade", {C::Mech, "knife_graze", 5.0f, 0.80f}},
+        {"impact_blade_deep", {C::Mech, "knife_graze", 4.5f, 0.85f}},
+
+        // --- UI: only crisp Dead Eye mark & weapon wheel detent clicks ---
+        {"wheel_tick", {C::UI, "", 5.5f, 0.55f}},
+        {"deadeye_mark", {C::UI, "", 7.0f, 0.85f}},
+
+        // --- Ambient: only real knife skinning recording ---
+        {"skin_cut", {C::Ambient, "knife_graze", 5.0f, 0.60f}},
     };
     auto it = m.find(cue);
-    return it == m.end() ? "" : it->second;
+    return it == m.end() ? kNone : it->second;
+}
+
+SpeakerCategory HapticLibrary::speaker_category(const std::string& name) {
+    return speaker_spec(name).cat;
 }
 
 bool HapticLibrary::speaker_sound(const Cue& cue, Stereo& out) {
     std::lock_guard<std::recursive_mutex> l(mu_);
-    std::string role = speaker_role(cue.name);
-    if (role.empty()) return false;
-    if (game_) {
+    const SpeakerSpec& spec = speaker_spec(cue.name);
+    if (spec.cat == SpeakerCategory::None || cue.gain <= 0.001f) return false;
+    const float scale = clampv(spec.gain * clampv(cue.gain, 0.15f, 1.5f), 0.05f, 1.35f);
+    if (game_ && spec.role[0] != '\0') {
         for (const std::string& bank : {cue.bank, std::string("WEAPONS")}) {
             if (bank.empty()) continue;
-            auto vs = game_->variants(bank, role);
+            auto vs = game_->variants(bank, spec.role);
             if (!vs.empty()) {
                 const GameSound* s = vs[size_t(rng_.below(int(vs.size())))];
-                LOGD("speaker: %s = recording %s/%s (%zu to pick from)", cue.name.c_str(), bank.c_str(), s->key.c_str(), vs.size());
-                std::vector<float> L = dsp::resample(s->left.data(), s->left.size(), s->rate);
-                std::vector<float> R = s->right.empty() ? L : dsp::resample(s->right.data(), s->right.size(), s->rate);
-                out.resize(L.size() * 2);
-                for (size_t i = 0; i < L.size(); ++i) { out[2 * i] = L[i]; out[2 * i + 1] = R[std::min(i, R.size() - 1)]; }
+                std::string ck = bank + "/" + s->key;
+                auto cit = speaker_cache_.find(ck);
+                if (cit != speaker_cache_.end()) {
+                    out = cit->second;
+                } else {
+                    LOGD("speaker: %s = recording %s/%s (%zu to pick from)", cue.name.c_str(), bank.c_str(), s->key.c_str(), vs.size());
+                    std::vector<float> L = dsp::resample(s->left.data(), s->left.size(), s->rate);
+                    std::vector<float> R = s->right.empty() ? L : dsp::resample(s->right.data(), s->right.size(), s->rate);
+                    out.resize(L.size() * 2);
+                    for (size_t i = 0; i < L.size(); ++i) { out[2 * i] = L[i]; out[2 * i + 1] = R[std::min(i, R.size() - 1)]; }
+                    speaker_cache_[ck] = out;
+                }
+                for (float& x : out) x = clampv(x * scale, -1.0f, 1.0f);
                 return true;
             }
         }
     }
-    // no recording: the same mechanism re-synthesized at an audible pitch
-    LOGD("speaker: %s has no recording (role %s) - synthesized", cue.name.c_str(), role.c_str());
     if (!recipes_.contains(cue.name)) return false;
+    const std::string cache_key = cue.name + "#spk" + std::to_string(int(std::lround(spec.fm * 10.0f)));
+    if (!buffers_.count(cache_key))
+        LOGD("speaker: %s (fm %.1f) - synthesized", cue.name.c_str(), double(spec.fm));
     try {
-        const auto& v = render_recipe(cue.name, 0, true);
+        const auto& v = render_recipe(cue.name, 0, true, spec.fm);
         if (v.empty()) return false;
-        out = v[0];
+        out = v[size_t(rng_.below(int(v.size())))];
+        for (float& x : out) x = clampv(x * scale, -1.0f, 1.0f);
     } catch (...) {
         return false;
     }

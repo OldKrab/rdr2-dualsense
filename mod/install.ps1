@@ -19,6 +19,12 @@ function Find-GameDir {
             }
         }
     } catch {}
+    foreach ($rk in "HKLM:\SOFTWARE\WOW6432Node\Rockstar Games\Red Dead Redemption 2", "HKLM:\SOFTWARE\Rockstar Games\Red Dead Redemption 2") {
+        try {
+            $p = (Get-ItemProperty $rk -ErrorAction Stop).InstallFolder
+            if ($p) { $cands += $p }
+        } catch {}
+    }
     $cands += "C:\Program Files\Rockstar Games\Red Dead Redemption 2", "C:\Program Files\Epic Games\RedDeadRedemption2"
     return $cands | Where-Object { Test-Path (Join-Path $_ "RDR2.exe") } | Select-Object -First 1
 }
@@ -79,12 +85,20 @@ if (-not (Test-Path $lml)) {
     Copy-Item (Join-Path $lmlSrc "data\gamepad_icons_pc.ytd"), (Join-Path $lmlSrc "data\pm_settings_controls.ytd") (Join-Path $dst "data") -Force
     foreach ($a in $archives) {
         $to = Join-Path $lml $a
+        $srcArch = Join-Path $lmlSrc $a
+        $srcHash = (Get-FileHash $srcArch).Hash
+        $hashMarker = "$to.dualsense-hash"
         if ((Test-Path $to) -and -not (Test-Path "$to.dualsense-backup")) {
-            # another mod's archive: keep it so uninstall.ps1 can put it back
-            if ((Get-FileHash $to).Hash -ne (Get-FileHash (Join-Path $lmlSrc $a)).Hash) { Copy-Item $to "$to.dualsense-backup" }
+            $curHash = (Get-FileHash $to).Hash
+            $ours = (Test-Path $hashMarker) -and ((Get-Content $hashMarker -Raw).Trim() -eq $curHash)
+            if (-not $ours -and ($curHash -ne $srcHash)) {
+                # another mod's archive: keep it so uninstall.ps1 can put it back
+                Copy-Item $to "$to.dualsense-backup"
+            }
         }
         New-Item -ItemType Directory -Force (Split-Path $to) | Out-Null
-        Copy-Item (Join-Path $lmlSrc $a) $to -Force
+        Copy-Item $srcArch $to -Force
+        Set-Content -Path $hashMarker -Value $srcHash -NoNewline
     }
     Write-Host "Installed the Settings page (Settings > Controls > Controller > DualSense)"
 }

@@ -18,6 +18,8 @@ struct Biquad {
         float y = b0 * x + z1;
         z1 = b1 * x - a1 * y + z2;
         z2 = b2 * x - a2 * y;
+        if (std::fabs(z1) < 1e-20f) z1 = 0.0f;
+        if (std::fabs(z2) < 1e-20f) z2 = 0.0f;
         return y;
     }
 };
@@ -42,6 +44,7 @@ struct Follower {   // one-pole envelope follower
     float run(float x) {
         x = std::fabs(x);
         e = x > e ? att * e + (1 - att) * x : rel * e + (1 - rel) * x;
+        if (e < 1e-20f) e = 0.0f;
         return e;
     }
 };

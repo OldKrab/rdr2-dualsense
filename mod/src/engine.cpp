@@ -15,10 +15,19 @@ bool Calibration::load(const fs::path& p) {
     if (!in) return false;
     try {
         json j = json::parse(in);
+        if (!j.is_object() || !j.contains("r2") || !j.contains("l2") ||
+            !j["r2"].is_array() || !j["l2"].is_array() || j["r2"].size() != 10 || j["l2"].size() != 10)
+            return false;
+        std::array<int, 10> nr{}, nl{};
         for (int i = 0; i < 10; ++i) {
-            r2[i] = j["r2"][i].get<int>();
-            l2[i] = j["l2"][i].get<int>();
+            if (!j["r2"][i].is_number_integer() || !j["l2"][i].is_number_integer()) return false;
+            nr[i] = j["r2"][i].get<int>();
+            nl[i] = j["l2"][i].get<int>();
+            if (nr[i] < 0 || nr[i] > 255 || nl[i] < 0 || nl[i] > 255) return false;
+            if (i > 0 && (nr[i] < nr[i - 1] || nl[i] < nl[i - 1])) return false;
         }
+        r2 = nr;
+        l2 = nl;
         calibrated = true;
     } catch (...) {
         return false;
@@ -81,10 +90,13 @@ WeaponEngine::WeaponEngine(const json& prof, const Calibration& cal, const Setti
     if (wf.size() == 3) weapon_fx_ = {wf[0], wf[1], wf[2]};
     auto sf = jints(f, "simple_weapon");
     if (sf.size() == 3) simple_fx_ = {sf[0], sf[1], sf[2]};
+    break_zone_ = clampv(int(jnum(f, "break_zone", 6)), 0, 9);
+    reset_click_ = f.value("reset_click", true);
+    pre_cue_ = jstr(p_, "pre");
     if (f.contains("break_raw")) break_raw_ = f["break_raw"].get<int>();
     else if (mode_ == "weapon" || mode_ == "hybrid") break_raw_ = cal_.raw_at(weapon_fx_[1]) + s.fire_margin;
     else if (mode_ == "simple_weapon") break_raw_ = simple_fx_[1];
-    else break_raw_ = cal_.raw_at(int(jnum(f, "break_zone", 6))) + s.fire_margin;
+    else break_raw_ = cal_.raw_at(break_zone_) + s.fire_margin;
     if (!f.contains("break_raw") && kind_ == "gun" && !learned_path.empty()) {
         std::ifstream in(learned_path);
         json l = json::parse(in, nullptr, false);
@@ -108,12 +120,18 @@ WeaponEngine::WeaponEngine(const json& prof, const Calibration& cal, const Setti
     kick_.base = jints(trig, "steps");
     kick_.step_s = jnum(trig, "step_ms", 16) / 1000;
     float ks = s.kick_scale * jnum(p_, "kick_scale", 1.0f);
-    for (int a : kick_.base) kick_.steps.push_back(clampv(int(std::lround(a * ks)), 1, 8));
+    if (ks > 0.001f)
+        for (int a : kick_.base) kick_.steps.push_back(clampv(int(std::lround(a * ks)), 1, 8));
     lock_s_ = jnum(rec, "lock_ms", 5) / 1000;
     shot_haptic_ = jstr(rec, "haptic");
     haptic_gain_ = jnum(p_, "haptic_gain", 1.0f);
     rate_s_ = jnum(p_, "rate_ms", 400) / 1000;
     action_ = p_.value("action", json{{"type", "none"}});
+    action_type_ = jstr(action_, "type", "none");
+    action_open_ = jstr(action_, "open");
+    action_close_ = jstr(action_, "close");
+    action_min_s_ = jnum(action_, "min_ms", 120) / 1000.0f;
+    action_fan_ = action_.value("fan", false);
     action_curve_ = zones_from(action_, "curve");
     action_break_raw_ = cal_.raw_at(int(jnum(action_, "break_zone", 7))) + s.fire_margin;
     if (action_.contains("ticks"))
@@ -183,8 +201,12 @@ WeaponEngine::Zones WeaponEngine::after_feel() const {
 }
 
 fx::Block WeaponEngine::fire_block(int raw, double now) {
-    if (clip_size_ && clip_ == 0 && empty_feel_ == "dead")
-        return fx::multi_feedback({0, 1, 1, 1, 1, 1, 1, 1, 1, 1});            // slide locked open: mush
+    if (clip_size_ && clip_ == 0) {
+        if (empty_feel_ == "dead")
+            return fx::multi_feedback({0, 1, 1, 1, 1, 1, 1, 1, 1, 1});        // slide locked open: mush
+        if (empty_feel_ == "click")
+            return fx::weapon(std::max(1, break_zone_ - 2), clampv(break_zone_, 2, 8), 2);
+    }
     if (mode_ == "weapon") return fx::weapon(weapon_fx_[0], weapon_fx_[1], weapon_fx_[2]);
     if (mode_ == "simple_weapon") return fx::simple_weapon(simple_fx_[0], simple_fx_[1], simple_fx_[2]);
     if (mode_ == "hybrid" && raw >= cal_.raw_at(weapon_fx_[0]) - 6) return fx::weapon(weapon_fx_[0], weapon_fx_[1], weapon_fx_[2]);
@@ -194,8 +216,7 @@ fx::Block WeaponEngine::fire_block(int raw, double now) {
     if (dead_eye_)
         for (auto& v : z) if (v) v = std::min(8, v + 1);           // time thickens
     if (float d = dirt(); d >= 0.15f) {                            // a dirty gun drags through the take-up
-        int bz = int(jnum(p_.value("fire", json::object()), "break_zone", 6));
-        for (int i = 0; i < bz && i < 10; ++i) if (z[i]) z[i] = std::min(8, z[i] + int(std::lround(d * 1.5f)));
+        for (int i = 0; i < break_zone_ && i < 10; ++i) if (z[i]) z[i] = std::min(8, z[i] + int(std::lround(d * 1.5f)));
     }
     return fx::multi_feedback(texture(z, raw, now));
 }
@@ -264,7 +285,8 @@ EngineFrame WeaponEngine::update(const InputState& in, const GameHints& g) {
             game_kick_mult_ = g.kick_mult;
             float ks = set_.kick_scale * jnum(p_, "kick_scale", 1.0f) * game_kick_mult_;
             kick_.steps.clear();
-            for (int a : kick_.base) kick_.steps.push_back(clampv(int(std::lround(a * ks)), 1, 8));
+            if (ks > 0.001f)
+                for (int a : kick_.base) kick_.steps.push_back(clampv(int(std::lround(a * ks)), 1, 8));
         }
     } else if (pressed & SQUARE && clip_size_ && clip_ < clip_size_ && (state_ == "ready" || state_ == "held")) {
         start_reload(now);
@@ -328,8 +350,27 @@ fx::Block WeaponEngine::update_gun(int raw, double now, EngineFrame& f, const Ga
         if (g.reloading && state_ != "reloading") {
             state_ = "reloading";
             game_rt_ = 0;
+            reload_clip_ = clip_;
+            reload_start_clip_ = clip_;
+            play(f, jstr(reload_, "begin"));
+        } else if (state_ == "reloading" && g.reloading) {
+            if (clip_size_ && reload_clip_ >= 0 && clip_ > reload_clip_) {
+                play(f, jstr(reload_, "tick", "reload_round"));
+                reload_clip_ = clip_;
+            }
         } else if (!g.reloading && state_ == "reloading") {
-            state_ = "ready";
+            bool jumped_end = clip_size_ && reload_clip_ >= 0 && clip_ > reload_clip_;
+            bool any_added = !clip_size_ || (reload_start_clip_ >= 0 && clip_ > reload_start_clip_);
+            if (jumped_end) play(f, jstr(reload_, "tick", "reload_round"));
+            if (any_added) {
+                Cue end = cue(jstr(reload_, "end"));
+                if (jumped_end && !end.name.empty()) timers_.push_back({now + 0.14 * slow(), end});
+                else if (!end.name.empty()) play(f, end.name);
+            }
+            game_rt_ = 0;
+            rt_low_t_ = now;
+            state_ = raw > reset_raw_ ? "held" : "ready";
+            reload_clip_ = reload_start_clip_ = -1;
         }
         // fire-rate sync: a shot we felt but the game did not take means we re-armed too early
         if (unconfirmed_since_ > 0 && !ready_usable_) {
@@ -366,27 +407,19 @@ fx::Block WeaponEngine::update_gun(int raw, double now, EngineFrame& f, const Ga
         if (dead_eye_ && fired && now - shot_t_ > 0.14 && now - kick_t_ > 0.14) {
             shot_t_ = now;
             kick_t_ = now;
+            fire_t_ = now;
             last_dry_ = false;
             schedule(now, shot_haptic_, haptic_gain_);
         }
-        if (dead_eye_ && now - kick_t_ >= 0 && now - kick_t_ < kick_.duration(slow())) {
-            fx::Block k;
-            if (kick_.block(float(now - kick_t_), slow(), k)) return k;
-        }
     }
-    // Free fire: the game decides when the gun can shoot, we only pass every press on. Its "ready to shoot" stays
-    // false for 1.5 s and more after a shot (double action, from the hip, two guns), so waiting for it swallowed
-    // presses. Working the action with R2 is kept for aimed shots with one single-action / lever / bolt / pump gun.
-    const std::string at_type = jstr(action_, "type", "none");
-    const bool manual = at_type != "none" && at_type != "semi" && set_.manual_action;
+    const bool manual = action_type_ != "none" && action_type_ != "semi" && set_.manual_action;
     const bool free_fire = g.valid && (!manual || g.hip_fire || g.dual_wield);
     const int reset = free_fire ? std::max(reset_raw_, break_raw_ - 50) : reset_raw_;
     if (free_fire && (state_ == "action" || state_ == "cycling")) state_ = "held";
     const std::string st = state_;
     if (st == "ready") {
         crossed(ticks_, raw, f, now);
-        std::string pre = jstr(p_, "pre");
-        if (!pre.empty() && cal_.zone_of(prev_raw_) < 2 && cal_.zone_of(raw) >= 2) play(f, pre);
+        if (!pre_cue_.empty() && cal_.zone_of(prev_raw_) < 2 && cal_.zone_of(raw) >= 2) play(f, pre_cue_);
         // quick follow-up shots don't need the whole pull again; the game must have seen R2 released (2 frames)
         const bool follow_up = free_fire && now - shot_t_ < 0.7;
         const int fire_at = follow_up ? std::min(break_raw_, reset + 20) : break_raw_;
@@ -412,9 +445,7 @@ fx::Block WeaponEngine::update_gun(int raw, double now, EngineFrame& f, const Ga
         bool game_rate = g.valid && ready_usable_;
         if (!free_fire && game_rate && !g.ready && raw <= reset) {
             if (not_ready_since_ < 0) not_ready_since_ = now;
-            // a manual action (single-action hammer, lever, bolt, pump) that isn't ready needs its R2 stroke
-            std::string at0 = jstr(action_, "type", "none");
-            if (at0 != "none" && at0 != "semi" && set_.manual_action && clip_ != 0 && now - shot_t_ > 0.08) {
+            if (manual && clip_ != 0 && now - shot_t_ > 0.08) {
                 state_ = "action";
                 not_ready_since_ = -1;
                 return fx::multi_feedback(action_feel());
@@ -425,20 +456,21 @@ fx::Block WeaponEngine::update_gun(int raw, double now, EngineFrame& f, const Ga
             }
         }
         bool can_rearm = free_fire || (game_rate ? g.ready : now - shot_t_ >= rate_s_ * slow());
-        // free fire: released at any moment since the shot counts - also during the kick above
-        if (can_rearm && (free_fire ? game_rt_ == 0 : raw <= reset) && now - shot_t_ > 0.05) {
+        // Require the trigger to actually be below reset (or freshly crossing from below) so a release-and-repull
+        // during kick cannot fire an unintended shot on the first frame back in 'ready'.
+        bool released = free_fire ? (game_rt_ == 0 && raw <= reset) : (raw <= reset);
+        if (can_rearm && released && now - shot_t_ > 0.05) {
             not_ready_since_ = -1;
             if (last_dry_ && clip_size_ && !g.valid) {
                 start_reload(now);
                 return fx::off();
             }
-            std::string at = jstr(action_, "type", "none");
-            if (!free_fire && !game_rate && at != "none" && at != "semi" && set_.manual_action && clip_ != 0) {
+            if (!free_fire && !game_rate && manual && clip_ != 0) {
                 state_ = "action";
                 return fx::multi_feedback(action_feel());
             }
             state_ = "ready";
-            if (p_.value("fire", json::object()).value("reset_click", true) && !last_dry_) play(f, "reset_click");
+            if (reset_click_ && !last_dry_) play(f, "reset_click");
             return fire_block(raw, now);
         }
         Zones after = after_feel();
@@ -451,13 +483,13 @@ fx::Block WeaponEngine::update_gun(int raw, double now, EngineFrame& f, const Ga
         }
         crossed(action_ticks_, raw, f, now);
         if (raw >= action_break_raw_) {
-            bool fan = action_.value("fan", false) && set_.fanning && l2_ < kAimRaw && now - shot_t_ < 0.9 * slow();
+            bool fan = action_fan_ && set_.fanning && l2_ < kAimRaw && now - shot_t_ < 0.9 * slow();
             if (fan) {                     // palm slaps the hammer: cock and fire in one stroke
                 play(f, "hammer_cock_auto", 0.7f);
                 shoot(raw, now, f, true);
                 return stop_block();
             }
-            Cue c = cue(jstr(action_, "open"));
+            Cue c = cue(action_open_);
             c.speaker = true;
             if (!c.name.empty()) timers_.push_back({now, c});
             state_ = "cycling";
@@ -468,13 +500,18 @@ fx::Block WeaponEngine::update_gun(int raw, double now, EngineFrame& f, const Ga
         return fx::multi_feedback(action_feel());
     }
     if (st == "cycling") {
-        bool done = g.valid && ready_usable_ ? g.ready : now - action_t_ >= jnum(action_, "min_ms", 120) / 1000;
+        if (g.valid && ready_usable_ && !g.ready && now - action_t_ > 2.5) {
+            ready_usable_ = false;
+            LOGI("%s: cycling timed out waiting for 'ready' - falling back to timing", id_.c_str());
+        }
+        bool done = g.valid && ready_usable_ ? g.ready : now - action_t_ >= action_min_s_;
         if (raw <= reset_raw_ && done) {
-            Cue c = cue(jstr(action_, "close"));
+            Cue c = cue(action_close_);
             c.speaker = true;
             if (!c.name.empty()) timers_.push_back({now, c});
             state_ = "ready";
             game_rt_ = 0;
+            rt_low_t_ = now;
             return fire_block(raw, now);
         }
         return fx::off();
@@ -507,9 +544,11 @@ void WeaponEngine::shoot(int raw, double now, EngineFrame& f, bool fanned) {
         const auto& a = kick_variants_[size_t(variant)];
         float ks = set_.kick_scale * jnum(p_, "kick_scale", 1.0f) * game_kick_mult_;
         kick_.steps.clear();
-        for (size_t i = 0; i < kick_.base.size(); ++i) {
-            int au = i < a.size() ? a[i] : 1;
-            kick_.steps.push_back(clampv(int(std::lround(std::min(kick_.base[i], au) * ks)), 1, 8));
+        if (ks > 0.001f) {
+            for (size_t i = 0; i < kick_.base.size(); ++i) {
+                int au = i < a.size() ? a[i] : 1;
+                kick_.steps.push_back(clampv(int(std::lround(std::min(kick_.base[i], au) * ks)), 1, 8));
+            }
         }
     }
     if (in_game_ && kind_ == "gun") {
@@ -590,7 +629,8 @@ fx::Block WeaponEngine::update_auto(int raw, double now, EngineFrame& f) {
             ++shots_;
             schedule(now, shot_haptic_, haptic_gain_);
         }
-        int amp = kick_.steps.empty() ? 6 : kick_.steps[0];
+        if (kick_.steps.empty()) return fx::off();
+        int amp = kick_.steps[0];
         return fx::vibration(0, amp, std::max(1, int(std::lround(1 / interval))));
     }
     return fx::off();
@@ -599,47 +639,83 @@ fx::Block WeaponEngine::update_auto(int raw, double now, EngineFrame& f) {
 // ---------------- bow ----------------
 fx::Block WeaponEngine::update_bow(int raw, double now, EngineFrame& f) {
     int start_raw = cal_.raw_at(int(jnum(bow_, "start_zone", 2)));
-    int pos = int(jnum(bow_, "position", 1));
+    int pos = clampv(int(jnum(bow_, "position", 1)), 0, 8);
     double draw_s = jnum(bow_, "draw_ms", 900) / 1000 / speed();
+    float hi = clampv(jnum(bow_, "strength_to", 8), 1.0f, 8.0f);
+    float lo = clampv(std::max(4.0f, jnum(bow_, "strength_from", 4)), 1.0f, hi);
+    auto ramp = [&](float front, float back) {
+        Zones z{};
+        float span = float(std::max(1, 9 - pos));
+        for (int i = pos; i < fx::kZones; ++i) {
+            float u = float(i - pos) / span;
+            z[i] = clampv(int(std::lround(front + (back - front) * u)), 1, 8);
+        }
+        return z;
+    };
     if (state_ == "ready") {
         if (raw >= start_raw) {
             state_ = "draw";
             draw_t_ = now;
+            bow_creak_stage_ = 0;
+            bow_strain_t_ = now;
             game_rt_ = 255;
-            play(f, jstr(bow_, "creak"));
+            play(f, jstr(bow_, "creak", "bow_creak"), 0.85f);
         } else {
-            return fx::feedback(pos, int(jnum(bow_, "rest_strength", 1)));
+            float rest_front = clampv(std::max(3.0f, jnum(bow_, "rest_strength", 3)), 1.0f, 6.0f);
+            return fx::multi_feedback(ramp(rest_front, hi));
         }
     }
     if (state_ == "draw") {
         float p = float(std::min(1.0, (now - draw_t_) / draw_s));
         if (raw < start_raw - 8) {
             game_rt_ = 0;
-            state_ = "held";
-            shot_t_ = now;
             last_dry_ = false;
             if (p >= jnum(bow_, "min_draw", 0.35f)) {
+                state_ = "held";
+                shot_t_ = now;
                 ++shots_;
                 play(f, shot_haptic_.empty() ? "bow_release" : shot_haptic_, 0.35f + 0.65f * p);
                 kick_t_ = now + set_.audio_latency_ms / 1000;
                 schedule(now + rate_s_ * 0.7, jstr(bow_, "nock", "bow_nock"));
             } else {
+                state_ = "ready";
                 play(f, "bow_letdown");
                 kick_t_ = -10;
             }
             return fx::off();
         }
-        float eased = 1 - (1 - p) * (1 - p);
-        float lo = jnum(bow_, "strength_from", 2), hi = jnum(bow_, "strength_to", 7);
-        float strength = lo + (hi - lo) * eased;
+        if (bow_creak_stage_ == 0 && p >= 0.50f) {
+            bow_creak_stage_ = 1;
+            bow_strain_t_ = now;
+            play(f, jstr(bow_, "creak", "bow_creak"), 1.0f);
+        } else if (bow_creak_stage_ == 1 && p >= 0.95f) {
+            bow_creak_stage_ = 2;
+            bow_strain_t_ = now;
+            play(f, jstr(bow_, "creak", "bow_creak"), 1.3f);
+        }
+        float eased = 1.0f - (1.0f - p) * (1.0f - p);
+        float front = lo + (hi - lo) * eased;
+        float back = hi;
         double hold = now - draw_t_ - draw_s - jnum(bow_, "tremor_after_ms", 2500) / 1000;
         float tremor = game_tremor_;
         if (hold > 0) tremor += float(std::min(1.0, hold / 2.0));
-        if (tremor > 0) {
-            float depth = jnum(bow_, "tremor_depth", 2) * std::min(1.5f, tremor);
-            strength += depth * std::sin(2 * kPi * jnum(bow_, "tremor_hz", 9) * float(now)) + rng_.range(-0.4f, 0.4f) * depth;
+        if (tremor > 0.05f) {
+            float depth = std::min(2.2f, jnum(bow_, "tremor_depth", 2) * std::min(1.2f, tremor));
+            float wave = 0.5f * std::sin(2 * kPi * jnum(bow_, "tremor_hz", 9) * float(now)) - 0.5f;
+            float dip = depth * wave + rng_.range(-0.25f, 0.25f) * depth;
+            front = std::max(lo, front + dip);
+            back = std::max(std::min(6.0f, hi), back + dip);
+            if (now - bow_strain_t_ >= 0.24) {
+                bow_strain_t_ = now;
+                play(f, jstr(bow_, "creak", "bow_creak"), clampv(0.55f + 0.45f * tremor, 0.55f, 1.1f));
+            }
+        } else if (p >= 0.95f && now - bow_strain_t_ >= 0.45) {
+            bow_strain_t_ = now;
+            play(f, jstr(bow_, "creak", "bow_creak"), 0.45f);
         }
-        return fx::feedback(pos, clampv(int(std::lround(strength)), 1, 8));
+        // Keep solid FEEDBACK (0x21) through full draw rather than dropping into VIBRATION (0x26),
+        // which oscillates on/off and halves steady holding resistance.
+        return fx::multi_feedback(ramp(front, back));
     }
     if (state_ == "held") {
         fx::Block k;
@@ -660,54 +736,89 @@ fx::Block WeaponEngine::update_melee(uint32_t pressed, double now, EngineFrame& 
         else v.push_back(jstr(melee_, "impact", "impact_blade"));
         return v;
     };
-    auto land = [&](const std::string& result, float pan, double at) {
-        bool finisher = result == "hit" && combo_ >= int(jnum(melee_, "finisher_at", 3)) && !jstr(melee_, "finisher").empty();
+    auto land = [&](const std::string& result, float pan, double at, bool knockout = false) {
+        bool finisher = (knockout || (result == "hit" && combo_ >= int(jnum(melee_, "finisher_at", 3)))) && !jstr(melee_, "finisher").empty();
         std::string name;
+        float gain = knockout ? 1.35f : 1.0f;
         if (result == "hit") {
             auto v = impacts();
+            if (v.empty()) v.push_back("impact_blade");
             name = finisher ? jstr(melee_, "finisher") : v[size_t(rng_.below(int(v.size())))];
         } else if (result == "blocked") {
             name = jstr(melee_, "blocked", "melee_blocked");
         } else {
             name = jstr(melee_, "miss", "melee_miss");
         }
-        schedule(at, name, 1.0f, -1, true, pan);
+        schedule(at, name, gain, -1, true, pan);
+        if (result == "hit") {
+            melee_kick_until_ = at + (knockout || finisher ? 0.22 : 0.12);
+            melee_kick_amp_ = (knockout || finisher) ? 8 : 5;
+            melee_kick_both_ = knockout || finisher;
+        } else if (result == "blocked") {
+            melee_kick_until_ = at + 0.09;
+            melee_kick_amp_ = 4;
+            melee_kick_both_ = false;
+        }
         if (finisher) combo_ = 0;
-        last_strike_ = finisher ? "finisher" : result;
+        last_strike_ = knockout ? "knockout" : finisher ? "finisher" : result;
         LOGD("strike: %s", last_strike_.c_str());
     };
-    // in game: resolve pending strikes from real damage
+    // in game: resolve pending strikes from real damage (and distinguish knockouts)
     if (g.valid) {
+        if (melee_hits_seen_ < 0 || g.melee_hits < melee_hits_seen_) melee_hits_seen_ = g.melee_hits;
+        if (melee_ko_seen_ < 0 || g.melee_ko < melee_ko_seen_) melee_ko_seen_ = g.melee_ko;
+        int new_ko = g.melee_ko - melee_ko_seen_;
+        int new_hits = g.melee_hits - melee_hits_seen_;
+        melee_ko_seen_ = g.melee_ko;
+        melee_hits_seen_ = g.melee_hits;
         for (auto& s : strikes_) {
             if (s.done) continue;
-            if (g.melee_hits > s.hits_at_start) {
+            if (new_ko > 0 && g.melee_ko > s.ko_at_start) {
                 s.done = true;
-                land("hit", s.pan, now);
+                --new_ko;
+                if (new_hits > 0) --new_hits;
+                land("hit", s.pan, now, true);
+            } else if (new_hits > 0 && g.melee_hits > s.hits_at_start) {
+                s.done = true;
+                --new_hits;
+                land("hit", s.pan, now, false);
             } else if (now > s.deadline) {
                 s.done = true;
-                land(g.melee_target_near ? "blocked" : "miss", s.pan, now);
+                land(g.melee_target_near ? "blocked" : "miss", s.pan, now, false);
             }
         }
         strikes_.erase(std::remove_if(strikes_.begin(), strikes_.end(), [](const Strike& s) { return s.done; }), strikes_.end());
     }
-    if (!(pressed & R1) || now - shot_t_ <= jnum(melee_, "recover_ms", 330) / 1000 * sl) return fx::off();
-    bool in_combo = last_strike_ == "hit" && now - shot_t_ < jnum(melee_, "combo_ms", 1100) / 1000 * sl;
-    combo_ = in_combo ? combo_ + 1 : 1;
-    shot_t_ = now;
-    ++shots_;
-    hand_ = melee_.value("alternate", false) ? -hand_ : 1;
-    float pan = 0.65f * hand_;
-    Cue sw = cue(jstr(melee_, "swing", "melee_swing"));
-    sw.has_pan = true;
-    sw.pan = pan;
-    f.cues.push_back(sw);
-    double impact_at = now + jnum(melee_, "impact_ms", 140) / 1000 * sl;
-    if (g.valid) {
-        strikes_.push_back({impact_at + 0.3 * sl, pan, g.melee_hits, false});
-    } else {
-        std::string result = l2_ < kAimRaw ? "miss" : (rng_.uniform() < jnum(melee_, "block_chance", 0.15f) ? "blocked" : "hit");
-        land(result, pan, result == "miss" ? impact_at + 0.04 * sl : impact_at);
+    const uint32_t melee_btn = g.valid ? CIRCLE : (CIRCLE | R1);
+    if ((pressed & melee_btn) && now - shot_t_ > jnum(melee_, "recover_ms", 330) / 1000 * sl) {
+        bool in_combo = last_strike_ == "hit" && now - shot_t_ < jnum(melee_, "combo_ms", 1100) / 1000 * sl;
+        combo_ = in_combo ? combo_ + 1 : 1;
+        shot_t_ = now;
+        ++shots_;
+        hand_ = melee_.value("alternate", false) ? -hand_ : 1;
+        float pan = 0.65f * hand_;
+        Cue sw = cue(jstr(melee_, "swing", "melee_swing"));
+        sw.has_pan = true;
+        sw.pan = pan;
+        f.cues.push_back(sw);
+        melee_kick_until_ = now + 0.10;
+        melee_kick_amp_ = 3;
+        melee_kick_both_ = false;
+        double impact_at = now + jnum(melee_, "impact_ms", 140) / 1000 * sl;
+        if (g.valid) {
+            strikes_.push_back({impact_at + 0.3 * sl, pan, g.melee_hits, g.melee_ko, false});
+        } else {
+            std::string result = l2_ < kAimRaw ? "miss" : (rng_.uniform() < jnum(melee_, "block_chance", 0.15f) ? "blocked" : "hit");
+            land(result, pan, result == "miss" ? impact_at + 0.04 * sl : impact_at, false);
+        }
     }
+    if (now < melee_kick_until_) {
+        fx::Block b = fx::vibration(0, melee_kick_amp_, melee_kick_both_ ? 24 : 32);
+        if (melee_kick_both_) f.l2 = b;
+        return b;
+    }
+    // light tactile ready resistance for blades/heavy melee weapons
+    if (id_ != "WEAPON_UNARMED" && id_.find("FIST") == std::string::npos) return fx::feedback(5, 2);
     return fx::off();
 }
 
@@ -724,7 +835,12 @@ fx::Block WeaponEngine::update_fishing(int raw, double now, EngineFrame& f, cons
     int was = fish_state_;
     fish_state_ = st;
     if (st != was) {
-        if (st == 4) play(f, "cast");                                         // the line flies out
+        if ((st == 2 || st == 3) && was != 2 && was != 3) cast_start_t_ = now;
+        if (st == 4) {
+            play(f, "cast");                                                  // the line flies out
+            cast_pulse_until_ = now + 0.14;                                   // crisp release pulse on R2
+            cast_start_t_ = -1;
+        }
         if (st == 7) {                                                        // struck: the hook bites in
             play(f, "fish_hooked", clampv(0.6f + fs.weight_lb / 25.0f, 0.6f, 1.0f));
             fish_peak_ = 0;
@@ -752,7 +868,7 @@ fx::Block WeaponEngine::update_fishing(int raw, double now, EngineFrame& f, cons
     fish_cmd_ = fs.cmd;
 
     if (st == 7) {
-        fish_peak_ = std::max(fish_peak_ * 0.995f, fs.tension);
+        fish_peak_ = std::max(fish_peak_ * std::exp(-float(dt) / 0.8f), fs.tension);
         if (fs.tension > 0.85f) f.l2 = fx::vibration(0, 8, 30);              // about to snap: ease off!
         else f.l2 = fx::feedback(0, clampv(int(1 + std::lround(fs.tension * 7)), 1, 8));
         if (fs.struggle > 0.5f && now >= next_surge_) {                       // it fights: surges to its side
@@ -775,13 +891,21 @@ fx::Block WeaponEngine::update_fishing(int raw, double now, EngineFrame& f, cons
         next_flop_ = now + rng_.range(0.45f, 1.2f);
         play(f, "fish_flop", rng_.range(0.5f, 0.9f));
     }
-    // R2: loading the cast, then the strike when it bites
+    // R2: progressively heavier while loading the cast, crisp pulse on release, then strike on bite
+    if (now < cast_pulse_until_) return fx::vibration(0, 5, 24);
     if (waiting) {
         if (now < bite_until_) return fx::vibration(2, 7, 9);
         if (now < nibble_until_) return fx::vibration(2, 3, 14);
         return fx::feedback(3, 1);
     }
-    if (st == 2 || st == 3) return fx::multi_feedback({0, 0, 1, 1, 2, 2, 3, 3, 3, 3});
+    if (st == 2 || st == 3) {
+        if (cast_start_t_ < 0) cast_start_t_ = now;
+        float load = clampv(float((now - cast_start_t_) / 1.1), 0.0f, 1.0f);
+        int s_hi = clampv(int(std::lround(2.0f + 5.0f * load)), 2, 7);
+        int s_lo = std::max(1, s_hi / 2);
+        return fx::multi_feedback({0, 0, s_lo, s_lo, s_hi - 1, s_hi - 1, s_hi, s_hi, s_hi, s_hi});
+    }
+    cast_start_t_ = -1;
     return fx::off();
 }
 
@@ -798,17 +922,19 @@ fx::Block WeaponEngine::update_tension(int raw, uint32_t pressed, double now, En
         if (g.lasso_attached && state_ != "tethered") {
             state_ = "tethered";
             tether_t_ = now;
+            lasso_prev_ = g.lasso_pull;
             play(f, jstr(tn, "catch"));
         } else if (!g.lasso_attached && state_ == "tethered") {
             state_ = "ready";
+            lasso_prev_ = 0;
         }
     }
     if (state_ == "ready") {
-        if (raw >= break_raw_ && cal_.zone_of(prev_raw_) < cal_.zone_of(break_raw_)) {
+        if (raw >= break_raw_ && prev_raw_ < break_raw_ && (!live || now - shot_t_ > 0.25)) {
+            shot_t_ = now;
             play(f, shot_haptic_);
             if (!live) {
                 state_ = "flying";
-                shot_t_ = now;
             }
             return fx::off();
         }
@@ -841,7 +967,13 @@ fx::Block WeaponEngine::update_tension(int raw, uint32_t pressed, double now, En
             play(f, jstr(tn, "jerk"));
         }
         if (now < jerk_until_) strength = 8;
-        return fx::feedback(1, clampv(int(std::lround(strength)), 1, 8));
+        int s_int = clampv(int(std::lround(strength)), 1, 8);
+        // Both triggers stiffen while holding a roped target; hard pulls / jerks add struggle vibration
+        bool struggling = (now < jerk_until_) || pull > 0.65f;
+        fx::Block rope = struggling ? fx::vibration(1, std::max(4, s_int), clampv(int(std::lround(14.0f + pull * 14.0f)), 14, 28))
+                                    : fx::feedback(1, s_int);
+        f.l2 = rope;
+        return rope;
     }
     return fx::off();
 }
@@ -870,8 +1002,7 @@ void WeaponEngine::analyse(double now) {
         if (best_v < 1500 || best_v < 3 * speeds[speeds.size() / 2]) continue;
         // a real break can only happen where this gun's wall is: from one zone before the configured
         // break to three zones after it. Anything else is a fast pull or a tap, not a snap.
-        int bz = int(jnum(p_.value("fire", json::object()), "break_zone", 6));
-        if (snap_from < cal_.raw_at(std::max(1, bz - 1)) || snap_from > cal_.raw_at(std::min(10, bz + 3))) {
+        if (snap_from < cal_.raw_at(std::max(1, break_zone_ - 1)) || snap_from > cal_.raw_at(std::min(10, break_zone_ + 3))) {
             LOGD("%s: ignored a jump at raw %d (not where the wall is)", id_.c_str(), snap_from);
             continue;
         }
@@ -880,17 +1011,21 @@ void WeaponEngine::analyse(double now) {
         if (set_.auto_align && snaps_.size() >= 3 && kind_ == "gun") {
             std::vector<int> s = snaps_;
             std::sort(s.begin(), s.end());
-            int target = s[s.size() / 2] + 2;
+            int target = clampv(s[s.size() / 2] + 2, 30, 254);
             if (std::abs(target - break_raw_) >= 3) {
                 LOGI("%s: shot point %d -> %d (the trigger snaps at ~%d)", id_.c_str(), break_raw_, target, target - 2);
                 break_raw_ = target;
-                reset_raw_ = std::min(reset_raw_, target - 25);
-                if (!learned_path.empty()) {             // remember it for the next game start
+                reset_raw_ = std::max(0, std::min(reset_raw_, target - 25));
+                if (!learned_path.empty()) {             // remember it for the next game start (atomic write)
                     json l;
                     { std::ifstream in(learned_path); l = json::parse(in, nullptr, false); }
                     if (!l.is_object()) l = json::object();
                     l[id_] = target;
-                    std::ofstream(learned_path) << l.dump(2);
+                    fs::path tmp = learned_path;
+                    tmp += L".tmp";
+                    bool wrote = false;
+                    { std::ofstream out(tmp, std::ios::binary | std::ios::trunc); out << l.dump(2); wrote = out.good(); }
+                    if (wrote) MoveFileExW(tmp.c_str(), learned_path.c_str(), MOVEFILE_REPLACE_EXISTING);
                 }
             }
         }

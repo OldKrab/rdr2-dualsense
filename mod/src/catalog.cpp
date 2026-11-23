@@ -18,36 +18,43 @@ json deep_merge(json base, const json& over) {
 }
 
 bool Catalog::load(const fs::path& path) {
+    by_name_.clear();
+    by_hash_.clear();
     std::ifstream in(path);
-    try {
-        raw_ = json::parse(in);
-    } catch (const std::exception& e) {
-        LOGE("weapons.json: %s", e.what());
-        raw_ = json::object();
+    if (!in) {
+        LOGE("weapons.json: could not open");
         return false;
     }
-    by_hash_.clear();
-    for (auto& w : raw_.value("weapons", json::array())) {
-        std::string name = w.value("name", "");
-        if (!name.empty()) by_hash_[joaat(name)] = name;
+    json raw;
+    try {
+        raw = json::parse(in);
+    } catch (const std::exception& e) {
+        LOGE("weapons.json: %s", e.what());
+        return false;
     }
-    LOGI("catalog: %zu weapons, %zu classes", by_hash_.size(), raw_.value("classes", json::object()).size());
+    const json classes = raw.contains("classes") && raw["classes"].is_object() ? raw["classes"] : json::object();
+    const json weapons = raw.contains("weapons") && raw["weapons"].is_array() ? raw["weapons"] : json::array();
+    for (const auto& w : weapons) {
+        if (!w.is_object()) continue;
+        std::string name = w.value("name", "");
+        if (name.empty()) continue;
+        std::string cls = w.value("class", "");
+        json prof = classes.contains(cls) && classes[cls].is_object() ? classes[cls] : json::object();
+        json meta = w;
+        meta.erase("tune");
+        prof = deep_merge(std::move(prof), meta);
+        if (w.contains("tune") && w["tune"].is_object()) prof = deep_merge(std::move(prof), w["tune"]);
+        prof["id"] = name;
+        by_hash_[joaat(name)] = name;
+        by_name_[name] = std::move(prof);
+    }
+    LOGI("catalog: %zu weapons, %zu classes", by_hash_.size(), classes.size());
     return true;
 }
 
 json Catalog::resolve_name(const std::string& name) const {
-    for (auto& w : raw_.value("weapons", json::array())) {
-        if (w.value("name", "") != name) continue;
-        std::string cls = w.value("class", "");
-        json prof = raw_["classes"].value(cls, json::object());
-        json meta = w;
-        meta.erase("tune");
-        prof = deep_merge(prof, meta);
-        prof = deep_merge(prof, w.value("tune", json::object()));
-        prof["id"] = name;
-        return prof;
-    }
-    return json();
+    auto it = by_name_.find(name);
+    return it == by_name_.end() ? json() : it->second;
 }
 
 json Catalog::resolve(uint32_t hash, uint32_t group, std::string& name_out) const {
@@ -56,19 +63,28 @@ json Catalog::resolve(uint32_t hash, uint32_t group, std::string& name_out) cons
         name_out = it->second;
         return resolve_name(it->second);
     }
-    // unknown weapon: behave like a typical member of its group
-    static const std::pair<const char*, const char*> groups[] = {
-        {"GROUP_REVOLVER", "WEAPON_REVOLVER_CATTLEMAN"}, {"GROUP_PISTOL", "WEAPON_PISTOL_SEMIAUTO"},
-        {"GROUP_REPEATER", "WEAPON_REPEATER_CARBINE"}, {"GROUP_RIFLE", "WEAPON_RIFLE_BOLTACTION"},
-        {"GROUP_SNIPER", "WEAPON_SNIPERRIFLE_ROLLINGBLOCK"}, {"GROUP_SHOTGUN", "WEAPON_SHOTGUN_PUMP"},
-        {"GROUP_BOW", "WEAPON_BOW"}, {"GROUP_THROWN", "WEAPON_THROWN_TOMAHAWK"}, {"GROUP_MELEE", "WEAPON_MELEE_KNIFE"},
-        {"GROUP_UNARMED", "WEAPON_UNARMED"}, {"GROUP_LASSO", "WEAPON_LASSO"}, {"GROUP_FISHINGROD", "WEAPON_FISHINGROD"},
-        {"GROUP_HEAVY", "WEAPON_TURRET_GATLING"}, {"GROUP_MG", "WEAPON_TURRET_GATLING"},
+    // unknown weapon: behave like a typical member of its group (pre-hashed once)
+    struct GroupFallback { uint32_t hash; const char* weapon; };
+    static const GroupFallback groups[] = {
+        {joaat("GROUP_REVOLVER"), "WEAPON_REVOLVER_CATTLEMAN"},
+        {joaat("GROUP_PISTOL"), "WEAPON_PISTOL_SEMIAUTO"},
+        {joaat("GROUP_REPEATER"), "WEAPON_REPEATER_CARBINE"},
+        {joaat("GROUP_RIFLE"), "WEAPON_RIFLE_BOLTACTION"},
+        {joaat("GROUP_SNIPER"), "WEAPON_SNIPERRIFLE_ROLLINGBLOCK"},
+        {joaat("GROUP_SHOTGUN"), "WEAPON_SHOTGUN_PUMP"},
+        {joaat("GROUP_BOW"), "WEAPON_BOW"},
+        {joaat("GROUP_THROWN"), "WEAPON_THROWN_TOMAHAWK"},
+        {joaat("GROUP_MELEE"), "WEAPON_MELEE_KNIFE"},
+        {joaat("GROUP_UNARMED"), "WEAPON_UNARMED"},
+        {joaat("GROUP_LASSO"), "WEAPON_LASSO"},
+        {joaat("GROUP_FISHINGROD"), "WEAPON_FISHINGROD"},
+        {joaat("GROUP_HEAVY"), "WEAPON_TURRET_GATLING"},
+        {joaat("GROUP_MG"), "WEAPON_TURRET_GATLING"},
     };
-    for (auto& [g, w] : groups) {
-        if (joaat(g) == group) {
-            name_out = std::string(w) + " (group fallback)";
-            json p = resolve_name(w);
+    for (const auto& g : groups) {
+        if (g.hash == group) {
+            name_out = std::string(g.weapon) + " (group fallback)";
+            json p = resolve_name(g.weapon);
             if (!p.is_null()) p["id"] = name_out;
             return p;
         }

@@ -44,31 +44,45 @@ std::string narrow(const wchar_t* w) {
     return s;
 }
 
+std::string lower_ascii(std::string s) {
+    for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
 }  // namespace
 
 bool Voice::start(const std::vector<std::string>& phrases, float min_conf, Handler h) {
+    std::lock_guard<std::mutex> l(mu_);
+    running_ = false;
+    if (thread_.joinable()) thread_.join();
     handler_ = std::move(h);
-    phrases_ = phrases;
+    phrases_.clear();
+    for (const auto& p : phrases) phrases_.push_back(lower_ascii(p));
     min_conf_ = min_conf;
     running_ = true;
-    thread_ = std::thread([this, phrases, min_conf] { loop(phrases, min_conf); });
+    enabled_ = true;
+    thread_ = std::thread([this, p = phrases_, min_conf] { loop(p, min_conf); });
     return true;
 }
 
 void Voice::stop() {
+    std::lock_guard<std::mutex> l(mu_);
+    enabled_ = false;
     running_ = false;
     if (thread_.joinable()) thread_.join();
 }
 
 void Voice::restart() {
-    if (!handler_) return;
-    stop();
+    std::lock_guard<std::mutex> l(mu_);
+    if (!enabled_.load() || !handler_) return;
+    running_ = false;
+    if (thread_.joinable()) thread_.join();
     running_ = true;
-    thread_ = std::thread([this] { loop(phrases_, min_conf_); });
+    thread_ = std::thread([this, p = phrases_, mc = min_conf_] { loop(p, mc); });
 }
 
 void Voice::loop(std::vector<std::string> phrases, float min_conf) {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     {
         Com<ISpRecognizer> rec;
         Com<ISpMMSysAudio> audio;
@@ -85,113 +99,111 @@ void Voice::loop(std::vector<std::string> phrases, float min_conf) {
         if (SUCCEEDED(hr)) hr = tokens->Next(1, &engine, nullptr);
         if (hr != S_OK || !engine) {
             LOGW("voice: no English (US) speech recognizer installed - voice commands off");
-            CoUninitialize();
-            return;
-        }
-        const char* step = "SetRecognizer";
-        hr = rec->SetRecognizer(engine.p);
-        // the controller mic as Windows' speech system lists it (audio input tokens)
-        Com<ISpObjectTokenCategory> inputs;
-        Com<IEnumSpObjectTokens> in_tokens;
-        Com<ISpObjectToken> mic;
-        if (SUCCEEDED(hr)) { step = "audio inputs"; hr = CoCreateInstance(kTokenCategory, nullptr, CLSCTX_ALL, __uuidof(ISpObjectTokenCategory), (void**)&inputs); }
-        if (SUCCEEDED(hr)) hr = inputs->SetId(L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\AudioInput", FALSE);
-        if (SUCCEEDED(hr)) hr = inputs->EnumTokens(nullptr, nullptr, &in_tokens);
-        if (SUCCEEDED(hr)) {
-            ISpObjectToken* t = nullptr;
-            while (!mic && in_tokens->Next(1, &t, nullptr) == S_OK) {
-                wchar_t* desc = nullptr;
-                if (SUCCEEDED(t->GetStringValue(nullptr, &desc)) && desc && wcsstr(desc, L"DualSens")) {
-                    mic.p = t;
-                    LOGI("voice: microphone %s", narrow(desc).c_str());
-                } else {
-                    t->Release();
+        } else {
+            const char* step = "SetRecognizer";
+            hr = rec->SetRecognizer(engine.p);
+            // the controller mic as Windows' speech system lists it (audio input tokens)
+            Com<ISpObjectTokenCategory> inputs;
+            Com<IEnumSpObjectTokens> in_tokens;
+            Com<ISpObjectToken> mic;
+            if (SUCCEEDED(hr)) { step = "audio inputs"; hr = CoCreateInstance(kTokenCategory, nullptr, CLSCTX_ALL, __uuidof(ISpObjectTokenCategory), (void**)&inputs); }
+            if (SUCCEEDED(hr)) hr = inputs->SetId(L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\AudioInput", FALSE);
+            if (SUCCEEDED(hr)) hr = inputs->EnumTokens(nullptr, nullptr, &in_tokens);
+            if (SUCCEEDED(hr)) {
+                ISpObjectToken* t = nullptr;
+                while (!mic && in_tokens->Next(1, &t, nullptr) == S_OK) {
+                    wchar_t* desc = nullptr;
+                    if (SUCCEEDED(t->GetStringValue(nullptr, &desc)) && desc && wcsstr(desc, L"DualSens")) {
+                        mic.p = t;
+                        LOGI("voice: microphone %s", narrow(desc).c_str());
+                    } else {
+                        t->Release();
+                    }
+                    if (desc) CoTaskMemFree(desc);
                 }
-                if (desc) CoTaskMemFree(desc);
             }
-        }
-        if (SUCCEEDED(hr) && mic) { step = "SetInput(token)"; hr = rec->SetInput(mic.p, TRUE); }
-        else if (SUCCEEDED(hr)) {
-            // fallback: the MM audio object on the DualSense wave-in device
-            step = "SetInput(device)";
-            hr = CoCreateInstance(kMMAudioIn, nullptr, CLSCTX_ALL, __uuidof(ISpMMSysAudio), (void**)&audio);
-            if (SUCCEEDED(hr) && dev >= 0) hr = audio->SetDeviceId(UINT(dev));
-            if (SUCCEEDED(hr)) hr = rec->SetInput(audio.p, TRUE);
-        }
-        if (SUCCEEDED(hr)) { step = "CreateRecoContext"; hr = rec->CreateRecoContext(&ctx); }
-        if (SUCCEEDED(hr)) { step = "events"; hr = ctx->SetNotifyWin32Event(); }
-        if (SUCCEEDED(hr)) hr = ctx->SetInterest(SPFEI(SPEI_RECOGNITION) | SPFEI(SPEI_HYPOTHESIS), SPFEI(SPEI_RECOGNITION) | SPFEI(SPEI_HYPOTHESIS));
-        if (SUCCEEDED(hr)) { step = "CreateGrammar"; hr = ctx->CreateGrammar(1, &grammar); }
-        if (FAILED(hr) || (!mic && dev < 0)) {
-            LOGW("voice: could not start the recognizer on the controller mic (%s: 0x%08lX, device %d)", step, hr, dev);
-            CoUninitialize();
-            return;
-        }
-        // commands + decoys: anything else said tends to land on a decoy
-        std::vector<std::string> words = phrases;
-        for (const char* d : {"hello", "hey", "how", "okay", "yes", "no", "go", "horse", "what", "hold", "now", "come", "the",
-                              "and", "you", "here", "there", "hi", "high", "doing", "day"})
-            words.push_back(d);
-        SPSTATEHANDLE rule = nullptr;
-        grammar->GetRule(L"words", 0, SPRAF_TopLevel | SPRAF_Active, TRUE, &rule);
-        for (auto& w : words) grammar->AddWordTransition(rule, nullptr, widen(w).c_str(), L" ", SPWT_LEXICAL, 1.0f, nullptr);
-        grammar->Commit(0);
-        grammar->SetRuleState(nullptr, nullptr, SPRS_ACTIVE);
-        std::string list;
-        for (auto& p : phrases) list += (list.empty() ? "" : " / ") + p;
-        LOGI("voice: listening for \"%s\" on the controller mic", list.c_str());
-        HANDLE ev = ctx->GetNotifyEventHandle();
-        double prev_end = -10;     // when the previous utterance (any word) ended
-        while (running_) {
-            if (WaitForSingleObject(ev, 200) != WAIT_OBJECT_0) continue;
-            SPEVENT e;
-            ULONG fetched = 0;
-            while (SUCCEEDED(ctx->GetEvents(1, &e, &fetched)) && fetched) {
-                if (e.eEventId == SPEI_HYPOTHESIS && e.elParamType == SPET_LPARAM_IS_OBJECT && e.lParam) {
-                    // an early guess while the word is still being said: lets the whistle detector stand down fast
-                    auto* res = reinterpret_cast<ISpRecoResult*>(e.lParam);
-                    wchar_t* text = nullptr;
-                    if (SUCCEEDED(res->GetText(SP_GETWHOLEPHRASE, SP_GETWHOLEPHRASE, TRUE, &text, nullptr)) && text) {
-                        std::string guess = narrow(text);
-                        if (std::find(phrases.begin(), phrases.end(), guess) != phrases.end()) last_command_guess = now_s();
-                        CoTaskMemFree(text);
+            if (SUCCEEDED(hr) && mic) { step = "SetInput(token)"; hr = rec->SetInput(mic.p, TRUE); }
+            else if (SUCCEEDED(hr)) {
+                // fallback: the MM audio object on the DualSense wave-in device
+                step = "SetInput(device)";
+                hr = CoCreateInstance(kMMAudioIn, nullptr, CLSCTX_ALL, __uuidof(ISpMMSysAudio), (void**)&audio);
+                if (SUCCEEDED(hr) && dev >= 0) hr = audio->SetDeviceId(UINT(dev));
+                if (SUCCEEDED(hr)) hr = rec->SetInput(audio.p, TRUE);
+            }
+            if (SUCCEEDED(hr)) { step = "CreateRecoContext"; hr = rec->CreateRecoContext(&ctx); }
+            if (SUCCEEDED(hr)) { step = "events"; hr = ctx->SetNotifyWin32Event(); }
+            if (SUCCEEDED(hr)) hr = ctx->SetInterest(SPFEI(SPEI_RECOGNITION) | SPFEI(SPEI_HYPOTHESIS), SPFEI(SPEI_RECOGNITION) | SPFEI(SPEI_HYPOTHESIS));
+            if (SUCCEEDED(hr)) { step = "CreateGrammar"; hr = ctx->CreateGrammar(1, &grammar); }
+            HANDLE ev = SUCCEEDED(hr) ? ctx->GetNotifyEventHandle() : INVALID_HANDLE_VALUE;
+            if (FAILED(hr) || (!mic && dev < 0) || !ev || ev == INVALID_HANDLE_VALUE) {
+                LOGW("voice: could not start the recognizer on the controller mic (%s: 0x%08lX, device %d)", step, hr, dev);
+            } else {
+                // commands + decoys: anything else said tends to land on a decoy
+                std::vector<std::string> words = phrases;
+                for (const char* d : {"hello", "hey", "how", "okay", "yes", "no", "go", "horse", "what", "hold", "now", "come", "the",
+                                      "and", "you", "here", "there", "hi", "high", "doing", "day"})
+                    words.push_back(d);
+                SPSTATEHANDLE rule = nullptr;
+                grammar->GetRule(L"words", 0, SPRAF_TopLevel | SPRAF_Active, TRUE, &rule);
+                for (auto& w : words) grammar->AddWordTransition(rule, nullptr, widen(w).c_str(), L" ", SPWT_LEXICAL, 1.0f, nullptr);
+                grammar->Commit(0);
+                grammar->SetRuleState(nullptr, nullptr, SPRS_ACTIVE);
+                std::string list;
+                for (auto& p : phrases) list += (list.empty() ? "" : " / ") + p;
+                LOGI("voice: listening for \"%s\" on the controller mic", list.c_str());
+                double prev_end = -10;     // when the previous utterance (any word) ended
+                while (running_) {
+                    DWORD wr = WaitForSingleObject(ev, 200);
+                    if (wr == WAIT_FAILED) break;
+                    if (wr != WAIT_OBJECT_0) continue;
+                    SPEVENT e;
+                    ULONG fetched = 0;
+                    while (SUCCEEDED(ctx->GetEvents(1, &e, &fetched)) && fetched) {
+                        if (e.eEventId == SPEI_HYPOTHESIS && e.elParamType == SPET_LPARAM_IS_OBJECT && e.lParam) {
+                            // an early guess while the word is still being said: lets the whistle detector stand down fast
+                            auto* res = reinterpret_cast<ISpRecoResult*>(e.lParam);
+                            wchar_t* text = nullptr;
+                            if (SUCCEEDED(res->GetText(SP_GETWHOLEPHRASE, SP_GETWHOLEPHRASE, TRUE, &text, nullptr)) && text) {
+                                std::string guess = lower_ascii(narrow(text));
+                                if (std::find(phrases.begin(), phrases.end(), guess) != phrases.end()) last_command_guess = now_s();
+                                CoTaskMemFree(text);
+                            }
+                            res->Release();
+                        } else if (e.eEventId == SPEI_RECOGNITION && e.elParamType == SPET_LPARAM_IS_OBJECT && e.lParam) {
+                            auto* res = reinterpret_cast<ISpRecoResult*>(e.lParam);
+                            SPPHRASE* ph = nullptr;
+                            if (SUCCEEDED(res->GetPhrase(&ph)) && ph) {
+                                wchar_t* text = nullptr;
+                                res->GetText(SP_GETWHOLEPHRASE, SP_GETWHOLEPHRASE, TRUE, &text, nullptr);
+                                std::string said = lower_ascii(narrow(text));
+                                float conf = ph->Rule.SREngineConfidence;
+                                bool command = std::find(phrases.begin(), phrases.end(), said) != phrases.end();
+                                SPRECORESULTTIMES times{};
+                                double len = SUCCEEDED(res->GetResultTimes(&times)) ? double(times.ullLength) / 1e7 : 0.0;
+                                double now = now_s(), start = now - len;
+                                const char* why = !command ? "ignored"
+                                                : conf < min_conf ? "too unsure"
+                                                : len > 1.2 ? "too long - part of a sentence"
+                                                : start - prev_end < 0.8 ? "no pause before - part of a conversation"
+                                                : "command";
+                                LOGD("voice heard \"%s\" (confidence %.2f, %.2f s, %s)", said.c_str(), conf, len, why);
+                                if (std::string(why) == "command" && listening_ && handler_) handler_(said, conf);
+                                prev_end = now;
+                                if (text) CoTaskMemFree(text);
+                                CoTaskMemFree(ph);
+                            }
+                            res->Release();
+                        } else if (e.elParamType == SPET_LPARAM_IS_OBJECT && e.lParam) {
+                            reinterpret_cast<IUnknown*>(e.lParam)->Release();
+                        } else if ((e.elParamType == SPET_LPARAM_IS_POINTER || e.elParamType == SPET_LPARAM_IS_STRING) && e.lParam) {
+                            CoTaskMemFree(reinterpret_cast<void*>(e.lParam));
+                        }
                     }
-                    res->Release();
-                } else if (e.eEventId == SPEI_RECOGNITION && e.elParamType == SPET_LPARAM_IS_OBJECT && e.lParam) {
-                    auto* res = reinterpret_cast<ISpRecoResult*>(e.lParam);
-                    SPPHRASE* ph = nullptr;
-                    if (SUCCEEDED(res->GetPhrase(&ph)) && ph) {
-                        wchar_t* text = nullptr;
-                        res->GetText(SP_GETWHOLEPHRASE, SP_GETWHOLEPHRASE, TRUE, &text, nullptr);
-                        std::string said = narrow(text);
-                        float conf = ph->Rule.SREngineConfidence;
-                        bool command = std::find(phrases.begin(), phrases.end(), said) != phrases.end();
-                        // a command is a word said on its own: short, after a pause. In a conversation the
-                        // recognizer keeps matching speech to its words ("and", "the"... and now and then "ciao").
-                        SPRECORESULTTIMES times{};
-                        double len = SUCCEEDED(res->GetResultTimes(&times)) ? double(times.ullLength) / 1e7 : 0.0;
-                        double now = now_s(), start = now - len;
-                        const char* why = !command ? "ignored"
-                                        : conf < min_conf ? "too unsure"
-                                        : len > 1.2 ? "too long - part of a sentence"
-                                        : start - prev_end < 0.8 ? "no pause before - part of a conversation"
-                                        : "command";
-                        LOGD("voice heard \"%s\" (confidence %.2f, %.2f s, %s)", said.c_str(), conf, len, why);
-                        if (std::string(why) == "command" && listening_ && handler_) handler_(said, conf);
-                        prev_end = now;
-                        if (text) CoTaskMemFree(text);
-                        CoTaskMemFree(ph);
-                    }
-                    res->Release();
-                } else if (e.elParamType == SPET_LPARAM_IS_OBJECT && e.lParam) {
-                    reinterpret_cast<IUnknown*>(e.lParam)->Release();
-                } else if ((e.elParamType == SPET_LPARAM_IS_POINTER || e.elParamType == SPET_LPARAM_IS_STRING) && e.lParam) {
-                    CoTaskMemFree(reinterpret_cast<void*>(e.lParam));
                 }
             }
         }
     }
-    CoUninitialize();
+    if (SUCCEEDED(co)) CoUninitialize();
 }
 
 }  // namespace dsr2

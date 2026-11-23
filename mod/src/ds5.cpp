@@ -14,19 +14,31 @@ static constexpr uint16_t kSony = 0x054C;
 static constexpr uint16_t kDualSense = 0x0CE6, kDualSenseEdge = 0x0DF2;
 
 static uint32_t crc32_table[256];
+static std::once_flag crc_once;
 static void crc_init() {
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t c = i;
-        for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-        crc32_table[i] = c;
-    }
+    std::call_once(crc_once, [] {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            crc32_table[i] = c;
+        }
+    });
 }
 static uint32_t crc32(const uint8_t* d, size_t n, uint32_t crc = 0xFFFFFFFFu) {
+    crc_init();
     for (size_t i = 0; i < n; ++i) crc = crc32_table[(crc ^ d[i]) & 0xFF] ^ (crc >> 8);
     return crc;
 }
 
-std::string DualSense::name() const { return name_; }
+uint32_t DualSense::bt_crc32(const uint8_t* data, size_t n) {
+    uint8_t seed = 0xA2;
+    return ~crc32(data, n, crc32(&seed, 1));
+}
+
+std::string DualSense::name() const {
+    std::lock_guard<std::mutex> l(dev_mu_);
+    return name_;
+}
 
 bool DualSense::start(Handler h) {
     crc_init();
@@ -44,21 +56,56 @@ void DualSense::stop() {
     if (thread_.joinable()) thread_.join();
     if (read_ev_) CloseHandle(read_ev_);
     if (write_ev_) CloseHandle(write_ev_);
-    read_ev_ = write_ev_ = nullptr;
+    if (hap_ev_) CloseHandle(hap_ev_);
+    read_ev_ = write_ev_ = hap_ev_ = nullptr;
+}
+
+void DualSense::parse_calibration(const uint8_t* feat) {
+    // DualSense feature report 0x05 layout (Linux hid-playstation):
+    // [1..6]: gyro pitch/yaw/roll bias (int16 LE)
+    // [7..18]: pitch+, pitch-, yaw+, yaw-, roll+, roll- (int16 LE)
+    // [19..22]: speed+, speed- (int16 LE)
+    auto i16 = [&](int off) -> int { return int(int16_t(feat[off] | (feat[off + 1] << 8))); };
+    int speed_2x = i16(19) + i16(21);
+    if (speed_2x <= 0 || speed_2x > 10000) {
+        gyro_cal_.valid = false;
+        return;
+    }
+    GyroCal cal;
+    for (int a = 0; a < 3; ++a) {
+        int bias = i16(1 + 2 * a);
+        int range = i16(7 + 4 * a) - i16(9 + 4 * a);
+        if (std::abs(bias) > 2048 || range <= 1000) {
+            gyro_cal_.valid = false;
+            return;
+        }
+        // Real deg/s = (raw - bias) * speed_2x / range. Normalize to 16.4 LSB/(deg/s).
+        cal.bias[a] = float(bias);
+        cal.scale[a] = (float(speed_2x) / float(range)) * 16.4f;
+        if (!std::isfinite(cal.scale[a]) || cal.scale[a] < 0.7f || cal.scale[a] > 1.4f) {
+            gyro_cal_.valid = false;
+            return;
+        }
+    }
+    cal.valid = true;
+    gyro_cal_ = cal;
 }
 
 bool DualSense::open() {
     routed_ = -1;                             // a (re)connected controller starts on the headphone jack again
+    headphones_ = false;
+    last_ = InputState{};
     GUID hid;
     HidD_GetHidGuid(&hid);
     HDEVINFO set = SetupDiGetClassDevsW(&hid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (set == INVALID_HANDLE_VALUE) return false;
-    struct Cand { std::wstring path; bool usb; size_t in, out; };
+    struct Cand { std::wstring path; bool usb; size_t in, out, feat; };
     std::vector<Cand> cands;
     SP_DEVICE_INTERFACE_DATA ifd{sizeof(ifd)};
     for (DWORD i = 0; SetupDiEnumDeviceInterfaces(set, nullptr, &hid, i, &ifd); ++i) {
         DWORD need = 0;
         SetupDiGetDeviceInterfaceDetailW(set, &ifd, nullptr, 0, &need, nullptr);
+        if (need < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)) continue;
         std::vector<uint8_t> buf(need);
         auto* det = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(buf.data());
         det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
@@ -78,7 +125,7 @@ bool DualSense::open() {
         }
         CloseHandle(h);
         if (ok) cands.push_back({det->DevicePath, caps.InputReportByteLength == 64, caps.InputReportByteLength,
-                                 caps.OutputReportByteLength});
+                                 caps.OutputReportByteLength, caps.FeatureReportByteLength});
     }
     SetupDiDestroyDeviceInfoList(set);
     std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.usb > b.usb; });
@@ -89,33 +136,51 @@ bool DualSense::open() {
         {
             std::lock_guard<std::mutex> l(dev_mu_);
             dev_ = h;
+            name_ = std::string("DualSense ") + (c.usb ? "USB" : "Bluetooth");
         }
         usb_ = c.usb;
         in_len_ = c.in;
         out_len_ = c.out;
-        name_ = std::string("DualSense ") + (c.usb ? "USB" : "Bluetooth");
-        if (!c.usb) {
-            uint8_t feat[64] = {0x05};          // calibration report switches BT to full 0x31 reports
-            HidD_GetFeature(dev_, feat, 41);
+        write_buf_.assign(std::max<size_t>(out_len_, c.usb ? 48 : 78), 0);
+        hap_buf_.assign(std::max<size_t>(out_len_, 142), 0);
+        gyro_cal_ = GyroCal{};
+        {
+            size_t flen = std::max<size_t>(c.feat, c.usb ? 64 : 41);
+            std::vector<uint8_t> feat(flen, 0);
+            feat[0] = 0x05;          // calibration report (also switches BT to full 0x31 reports)
+            if (HidD_GetFeature(h, feat.data(), ULONG(feat.size()))) {
+                parse_calibration(feat.data());
+            } else if (!c.usb && feat.size() != 41) {
+                uint8_t feat41[41] = {0x05};
+                if (HidD_GetFeature(h, feat41, 41)) parse_calibration(feat41);
+            }
         }
         lightbar_released_ = false;
         last_payload_.clear();
-        LOGI("controller: %s (in %zu, out %zu bytes)", name_.c_str(), in_len_, out_len_);
+        LOGI("controller: %s (in %zu, out %zu bytes%s)", name().c_str(), in_len_, out_len_,
+             gyro_cal_.valid ? ", gyro cal ok" : "");
         return true;
     }
     return false;
 }
 
 void DualSense::close() {
-    if (dev_ != INVALID_HANDLE_VALUE) {
+    connected_ = false;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    {
+        std::lock_guard<std::mutex> l(dev_mu_);
+        h = dev_;
+    }
+    if (h != INVALID_HANDLE_VALUE) {
         OutputState off;
         write(off, true);
-        CancelIo(dev_);
         std::lock_guard<std::mutex> l(dev_mu_);
-        CloseHandle(dev_);
-        dev_ = INVALID_HANDLE_VALUE;
+        if (dev_ != INVALID_HANDLE_VALUE) {
+            CancelIoEx(dev_, nullptr);
+            CloseHandle(dev_);
+            dev_ = INVALID_HANDLE_VALUE;
+        }
     }
-    connected_ = false;
 }
 
 static void parse(const uint8_t* d, InputState& s) {
@@ -150,6 +215,7 @@ static void parse(const uint8_t* d, InputState& s) {
     s.l2_feedback = d[42];
     s.effect_state = d[47];
     s.battery = std::min(10, d[52] & 0x0F);
+    s.battery_state = (d[52] >> 4) & 0x0F;
     s.headphones = (d[53] & 0x01) != 0;      // status[1] bit 0 (Linux hid-playstation: DS_STATUS1_HP_DETECT)
 }
 
@@ -165,7 +231,7 @@ void DualSense::build_payload(const OutputState& o, uint8_t* p) {
     }
     std::memcpy(p + 10, o.r2.data(), 11);
     std::memcpy(p + 21, o.l2.data(), 11);
-    p[36] = uint8_t(o.trigger_power_reduction & 7);
+    p[36] = uint8_t((o.trigger_power_reduction & 7) << 4);  // high nibble: trigger motor power reduction
     if (o.mute_led >= 0) {
         p[1] |= 0x01;
         p[8] = uint8_t(o.mute_led);
@@ -184,29 +250,39 @@ void DualSense::build_payload(const OutputState& o, uint8_t* p) {
     }
     // Audio output path (as the Linux hid-playstation driver does it): sent whenever it differs from what the
     // controller last accepted. Speaker: path 3 (right channel -> speaker), volume 0x64 (100%, accepted range
-    // 0x3D-0x64), preamp +6 dB. Headphones: path 0 (left/right -> jack).
+    // 0x3D-0x64), preamp +6 dB; when speaker_enabled is false, mute hardware speaker volume (0x00) and route to jack.
+    // Headphones: path 0 (left/right -> jack).
     routing_ = -1;
-    if (usb_ && (headphones_ ? 1 : 0) != routed_) {
-        routing_ = headphones_ ? 1 : 0;
+    const int want_route = headphones_ ? 1 : (o.speaker_enabled ? 2 : 0);
+    if (usb_ && want_route != routed_) {
+        routing_ = want_route;
         p[0] |= 0x80;                         // audio control
         if (headphones_) {
             p[7] = 0x00;
-        } else {
+        } else if (o.speaker_enabled) {
             p[7] = 0x30;
             p[0] |= 0x20;                     // speaker volume
             p[5] = 0x64;
             p[1] |= 0x80;                     // audio control 2
             p[37] = 0x02;                     // speaker preamp gain
+        } else {
+            p[7] = 0x00;                      // disable internal speaker path
+            p[0] |= 0x20;                     // speaker volume
+            p[5] = 0x00;                      // hardware speaker mute
         }
     }
 }
 
 bool DualSense::write(const OutputState& o, bool force) {
-    if (dev_ == INVALID_HANDLE_VALUE) return false;
     uint8_t payload[47];
     build_payload(o, payload);
     if (!force && last_payload_.size() == 47 && std::memcmp(last_payload_.data(), payload, 47) == 0) return true;
-    std::vector<uint8_t> rep(std::max<size_t>(out_len_, usb_ ? 48 : 78), 0);
+    std::lock_guard<std::mutex> l(dev_mu_);
+    if (dev_ == INVALID_HANDLE_VALUE) return false;
+    size_t want = std::max<size_t>(out_len_, usb_ ? 48 : 78);
+    if (write_buf_.size() != want) write_buf_.resize(want);
+    std::fill(write_buf_.begin(), write_buf_.end(), 0);
+    auto& rep = write_buf_;
     if (usb_) {
         rep[0] = 0x02;
         std::memcpy(rep.data() + 1, payload, 47);
@@ -216,9 +292,7 @@ bool DualSense::write(const OutputState& o, bool force) {
         rep[2] = 0x10;
         std::memcpy(rep.data() + 3, payload, 47);
         bt_seq_ = uint8_t((bt_seq_ + 1) & 0x0F);
-        uint8_t seed = 0xA2;
-        uint32_t crc = crc32(&seed, 1);
-        crc = ~crc32(rep.data(), 74, crc);
+        uint32_t crc = bt_crc32(rep.data(), 74);
         std::memcpy(rep.data() + 74, &crc, 4);
     }
     OVERLAPPED ov{};
@@ -228,7 +302,8 @@ bool DualSense::write(const OutputState& o, bool force) {
     BOOL ok = WriteFile(dev_, rep.data(), DWORD(rep.size()), &n, &ov);
     if (!ok && GetLastError() == ERROR_IO_PENDING) {
         if (WaitForSingleObject(write_ev_, 50) != WAIT_OBJECT_0) {
-            CancelIo(dev_);
+            CancelIoEx(dev_, &ov);
+            GetOverlappedResult(dev_, &ov, &n, TRUE);
             return false;
         }
         ok = GetOverlappedResult(dev_, &ov, &n, FALSE);
@@ -237,7 +312,7 @@ bool DualSense::write(const OutputState& o, bool force) {
     if (o.has_lightbar) lightbar_released_ = true;
     if (routing_ >= 0) {
         routed_ = routing_;
-        LOGI("controller audio: %s", routed_ ? "headphone jack" : "built-in speaker");
+        LOGI("controller audio: %s", routed_ == 1 ? "headphone jack" : routed_ == 2 ? "built-in speaker" : "built-in speaker muted");
     }
     last_payload_.assign(payload, payload + 47);
     return true;
@@ -249,7 +324,10 @@ bool DualSense::write(const OutputState& o, bool force) {
 bool DualSense::send_haptics(const uint8_t* pcm64) {
     std::lock_guard<std::mutex> l(dev_mu_);
     if (dev_ == INVALID_HANDLE_VALUE || usb_ || !connected_) return false;
-    std::vector<uint8_t> rep(std::max<size_t>(out_len_, 142), 0);
+    size_t want = std::max<size_t>(out_len_, 142);
+    if (hap_buf_.size() != want) hap_buf_.resize(want);
+    std::fill(hap_buf_.begin(), hap_buf_.end(), 0);
+    auto& rep = hap_buf_;
     rep[0] = 0x32;
     rep[2] = 0x80 | 0x11;
     rep[3] = 7;
@@ -258,9 +336,7 @@ bool DualSense::send_haptics(const uint8_t* pcm64) {
     rep[11] = 0x80 | 0x12;
     rep[12] = 64;
     std::memcpy(rep.data() + 13, pcm64, 64);
-    uint8_t seed = 0xA2;
-    uint32_t crc = crc32(&seed, 1);
-    crc = ~crc32(rep.data(), 138, crc);
+    uint32_t crc = bt_crc32(rep.data(), 138);
     std::memcpy(rep.data() + 138, &crc, 4);
     OVERLAPPED ov{};
     ov.hEvent = hap_ev_;
@@ -286,6 +362,7 @@ void DualSense::loop() {
             for (int i = 0; i < 20 && running_; ++i) Sleep(100);
             continue;
         }
+        buf.resize(std::max<size_t>(in_len_, 128));
         connected_ = true;
         int count = 0;
         double rate_t = now_s();
@@ -325,6 +402,12 @@ void DualSense::loop() {
                 } else {
                     continue;
                 }
+                if (gyro_cal_.valid) {
+                    for (int a = 0; a < 3; ++a) {
+                        float v = (float(s.gyro[a]) - gyro_cal_.bias[a]) * gyro_cal_.scale[a];
+                        s.gyro[a] = int16_t(clampv(std::lround(v), -32768L, 32767L));
+                    }
+                }
                 last_ = s;
                 ++count;
             }
@@ -340,6 +423,11 @@ void DualSense::loop() {
             } catch (const std::exception& e) {
                 LOGE("controller handler: %s", e.what());
             }
+        }
+        if (pending && dev_ != INVALID_HANDLE_VALUE) {
+            DWORD n = 0;
+            CancelIoEx(dev_, &ov);
+            GetOverlappedResult(dev_, &ov, &n, TRUE);
         }
         close();
     }

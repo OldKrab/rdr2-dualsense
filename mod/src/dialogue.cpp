@@ -125,6 +125,7 @@ void Dialogue::worker() {
     if (!running_) return;
     if (!gamemem::init()) {
         LOGW("dialogue haptics: the game's audio state was not found (other game version?) - off");
+        running_ = false;
         return;
     }
     awc::Index& ix = awc::index();
@@ -136,7 +137,17 @@ void Dialogue::worker() {
         cut_bits_[b >> 6] |= 1ull << (b & 63);
     }
     double next_scan = 0, next_out = 0;
+    bool was_cutscene = false;
     while (running_) {
+        bool in_cut = in_cutscene_.load();
+        if (in_cut && !was_cutscene) next_scan = 0;
+        was_cutscene = in_cut;
+        if (speech_gain_ <= 0) {
+            stop_cutscene();
+            std::unique_lock<std::mutex> l(mu_);
+            cv_.wait_for(l, std::chrono::milliseconds(500), [this] { return !running_ || speech_gain_ > 0; });
+            continue;
+        }
         if (now_s() >= next_out) {                     // where the sound goes (headphones switched on / off)
             next_out = now_s() + 2.0;
             std::string name;
@@ -164,10 +175,13 @@ void Dialogue::worker() {
             continue;
         }
         double now = now_s();
-        if (speech_gain_ > 0 && gamemem::pool_ok()) {
+        if (halted_.load()) {
+            stop_cutscene();
+        } else if (speech_gain_ > 0 && gamemem::pool_ok()) {
+            // Scan sound pool every 250 ms during cutscenes / active playback, and only every 2 s in free-roam
             if (now >= next_scan) {
                 cutscene_scan(now);
-                next_scan = now + 0.25;
+                next_scan = now + ((in_cutscene_.load() || tracks_on_) ? 0.25 : 2.0);
             }
             cutscene_poll(now);
         } else {
@@ -296,6 +310,10 @@ void Dialogue::cutscene_poll(double now) {
 }
 
 void Dialogue::prepare_line(uint64_t key, const awc::Entry& e, double t_start, float gl, float gr) {
+    {
+        std::lock_guard<std::mutex> l(mu_);
+        if (!active_keys_.count(key)) return;          // already ended before decode started
+    }
     std::vector<float> v;
     int rate = 0;
     if (!awc::decode_line(awc::index(), e, v, rate)) {
@@ -303,12 +321,16 @@ void Dialogue::prepare_line(uint64_t key, const awc::Entry& e, double t_start, f
         return;
     }
     auto h = std::make_shared<const std::vector<float>>(speech_haptic(to48k(std::move(v), rate)));
-    audio_->track_play(key, h, t_start + 30.0, gl, gr);     // waits: game_tick times it from the line's play clock
+    std::lock_guard<std::mutex> l(mu_);
+    if (!active_keys_.count(key)) return;              // ended while decoding: don't schedule a ghost track 30 s later
+    audio_->track_play(key, h, t_start + 30.0, gl, gr);
 }
 
-void Dialogue::game_tick(const std::vector<Talker>& talkers, uint32_t native_player_line) {
+void Dialogue::game_tick(const std::vector<Talker>& talkers, uint32_t native_player_line, bool halted, bool cutscene) {
+    halted_ = halted;
+    in_cutscene_ = cutscene;
     if (!running_ || !audio_) return;
-    bool on = speech_gain_ > 0 && !cutscenes_only_ && !speech_layout_bad_ && gamemem::speech_ok() && awc::index().ready();
+    bool on = !halted && speech_gain_ > 0 && !cutscenes_only_ && !speech_layout_bad_ && gamemem::speech_ok() && awc::index().ready();
     double now = now_s();
     for (auto& [a, s] : said_) s.seen = false;
     std::vector<gamemem::Request> reqs;
@@ -341,7 +363,13 @@ void Dialogue::game_tick(const std::vector<Talker>& talkers, uint32_t native_pla
                     audio_->track_move(key, t0, gl * g, gr * g);    // follows the speaker's side
                     continue;
                 }
-                if (it != said_.end()) audio_->track_stop(it->second.key);
+                if (it != said_.end()) {
+                    {
+                        std::lock_guard<std::mutex> l(mu_);
+                        active_keys_.erase(it->second.key);
+                    }
+                    audio_->track_stop(it->second.key);
+                }
                 said_[r.addr] = {key, now, true};
                 if (probes_on_) probe_start(r.sound, sid, r.voice, t.dist, t.player, now);
                 // the memory layout checked against the game's own native, on the player's lines
@@ -361,6 +389,8 @@ void Dialogue::game_tick(const std::vector<Talker>& talkers, uint32_t native_pla
                 }
                 {
                     std::lock_guard<std::mutex> l(mu_);
+                    active_keys_.insert(key);
+                    if (line_jobs_.size() >= 16) line_jobs_.pop_front();
                     line_jobs_.push_back({key, line, now, gl * g, gr * g});
                 }
                 cv_.notify_one();
@@ -369,6 +399,10 @@ void Dialogue::game_tick(const std::vector<Talker>& talkers, uint32_t native_pla
     }
     for (auto it = said_.begin(); it != said_.end();) {
         if (!it->second.seen) {
+            {
+                std::lock_guard<std::mutex> l(mu_);
+                active_keys_.erase(it->second.key);
+            }
             audio_->track_stop(it->second.key);
             it = said_.erase(it);
         } else {

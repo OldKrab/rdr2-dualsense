@@ -14,14 +14,17 @@ struct GameSound {
     int rate = 48000;
     std::vector<float> left, right;  // right empty = mono
     std::string auto_role;
-    float seconds() const { return left.empty() ? 0.f : float(left.size()) / rate; }
+    float seconds() const { return (left.empty() || rate <= 0) ? 0.f : float(left.size()) / rate; }
     std::vector<float> mono() const;
 };
 
 class GameAudio {
 public:
     void discover(const fs::path& game_dir, const fs::path& labels_json);
-    bool has_bank(const std::string& bank) const { return paths_.count(bank) != 0 || game_paths_.count(bank) != 0; }
+    bool has_bank(const std::string& bank) const {
+        std::lock_guard<std::recursive_mutex> l(mu_);
+        return paths_.count(bank) != 0 || game_paths_.count(bank) != 0;
+    }
     size_t bank_count(bool weapons_only) const;
     std::vector<std::string> game_files() const;     // what to preload from the game's archives
     const std::vector<GameSound>& sounds(const std::string& bank);
@@ -34,7 +37,7 @@ private:
     std::map<std::string, std::vector<std::string>> game_paths_;   // the rest: the game's own archives (game_files)
     std::map<std::string, std::vector<GameSound>> cache_;
     std::map<std::string, std::string> labels_;
-    std::mutex mu_;
+    mutable std::recursive_mutex mu_;
 };
 
 }  // namespace dsr2

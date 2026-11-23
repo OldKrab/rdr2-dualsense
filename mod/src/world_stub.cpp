@@ -9,6 +9,7 @@ World& world() {
 }
 
 void World::tick() {}
+void World::shutdown() {}
 GameSnapshot World::snapshot() { return GameSnapshot{}; }
 std::vector<WorldEvent> World::take_events() { return {}; }
 void World::add_gyro(float yaw, float pitch) {

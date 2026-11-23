@@ -5,6 +5,7 @@
 #include "config.h"
 #include "dsp.h"
 #include "engine.h"
+#include "features.h"
 #include "gameaudio.h"
 #include "haptics.h"
 #include "input.h"
@@ -78,6 +79,8 @@ struct Rig {
 }  // namespace
 
 int run_selftests(const fs::path& data) {
+    g_fail = 0;
+    g_pass = 0;
     // dialogue haptics: the spoken line's recording id from the game's speech data (a real greeting: context kept
     // before joaat's last mixing step, variation 1 -> the stream the game read from disk)
     CHECK(awc::line_stream_id(0xB87C92A7, 1) == 0x0C96A2A6, "speech line id: partial context hash + variation");
@@ -113,7 +116,7 @@ int run_selftests(const fs::path& data) {
         CHECK(r.shots_rt() == 1, "single shot, no refire while held");
         size_t first = 0;
         while (first < r.frames.size() && r.frames[first].game_rt != 255) ++first;
-        CHECK(first < r.frames.size() && r.raws[first] >= r.eng.break_raw() && r.raws[first - 1] < r.eng.break_raw(),
+        CHECK(first > 0 && first < r.frames.size() && r.raws[first] >= r.eng.break_raw() && r.raws[first - 1] < r.eng.break_raw(),
               "shot fires on the first sample past the break");
     }
     {   // single action: the next tap cocks the hammer (aiming, so no fanning)
@@ -150,6 +153,21 @@ int run_selftests(const fs::path& data) {
         r.hints.clip = 0;
         r.feed({0}).pull();
         CHECK(r.count("dry_fire") == 1, "game says empty: dry click");
+        // live reload emits begin gate, per-round ticks as clip grows, and end gate
+        Rig rl(catt);
+        rl.hints.valid = true;
+        rl.hints.clip = 2;
+        rl.feed({0});
+        rl.hints.reloading = true;
+        rl.feed({0});
+        rl.hints.clip = 3;
+        rl.feed({0});
+        rl.hints.clip = 4;
+        rl.feed({0});
+        rl.hints.reloading = false;
+        rl.feed({0});
+        CHECK(rl.count("cylinder_gate") == 2 && rl.count("reload_round") == 2,
+              "live reload emits cylinder gate and round ticks");
     }
     {   // fishing from the game's fishing task: bite on R2, line tension on L2, the fight, the catch
         Rig r(cat.resolve_name("WEAPON_FISHINGROD"));
@@ -204,21 +222,24 @@ int run_selftests(const fs::path& data) {
         CHECK(r.count("shot_revolver") - before == 3, "every volley shot kicks");
     }
     {   // ini numbers read the same whatever locale the game switches to (it uses a decimal comma)
-        fs::path tmp = fs::temp_directory_path() / "dsr2_locale_test.ini";
+        const std::string pid = std::to_string(GetCurrentProcessId());
+        fs::path tmp = fs::temp_directory_path() / ("dsr2_locale_test_" + pid + ".ini");
         { std::ofstream o(tmp); o << "[Gyro]\nVerticalRatio=0.75\n[Voice]\nMinConfidence=0,7\n"; }
         const char* prev = setlocale(LC_ALL, nullptr);
         std::string saved = prev ? prev : "C";
-        bool comma_locale = setlocale(LC_ALL, "Russian") != nullptr;
+        bool comma_locale = setlocale(LC_ALL, "Russian") != nullptr || setlocale(LC_ALL, "de_DE") != nullptr;
         Config cfg;
         cfg.load(tmp.wstring());
         CHECK(std::fabs(cfg.num("Gyro", "VerticalRatio", 9) - 0.75f) < 1e-4f &&
               std::fabs(cfg.num("Voice", "MinConfidence", 9) - 0.7f) < 1e-4f, "0.75 / 0,7 read right under a comma locale");
-        if (!comma_locale) printf("  (note: Russian locale not available, tested in the C locale)\n");
+        if (!comma_locale) printf("  (note: comma locale not available, tested in the C locale)\n");
         setlocale(LC_ALL, saved.c_str());
-        fs::remove(tmp);
+        std::error_code ec;
+        fs::remove(tmp, ec);
     }
     {   // the settings page writes the ini in place: comments and order kept, missing keys added, read back
-        fs::path tmp = fs::temp_directory_path() / "dsr2_set_test.ini";
+        const std::string pid = std::to_string(GetCurrentProcessId());
+        fs::path tmp = fs::temp_directory_path() / ("dsr2_set_test_" + pid + ".ini");
         { std::ofstream o(tmp); o << "; top comment\n[Haptics]\n; how strong\nFootsteps=0.22\n\n[Gyro]\nMode=off\n"; }
         Config cfg;
         cfg.load(tmp.wstring());
@@ -235,8 +256,11 @@ int run_selftests(const fs::path& data) {
         cfg.set("Gyro", "Mode", SettingsMenu::stepped(*gyro, cfg, +1));
         cfg.set("Triggers", "Enabled", SettingsMenu::stepped(*trig, cfg, -1));
         CHECK(cfg.str("Gyro", "Mode", "") == "aim" && !cfg.flag("Triggers", "Enabled", true), "choice and new section written");
-        std::ifstream in(tmp);
-        std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::string all;
+        {
+            std::ifstream in(tmp);
+            all.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        }   // close handle before subsequent atomic MoveFileExW writes in cfg.set()
         CHECK(all.find("; top comment") != std::string::npos && all.find("; how strong") != std::string::npos &&
               all.find("Footsteps=0.3") != std::string::npos && all.find("[Triggers]") != std::string::npos,
               "comments kept, value replaced in place, section appended");
@@ -246,11 +270,12 @@ int run_selftests(const fs::path& data) {
             cfg.set("Haptics", "Footsteps", v);
         }
         CHECK(SettingsMenu::value_text(*steps, cfg) == "Off", "left all the way: Off, then stops");
-        in.close();
-        fs::remove(tmp);
+        std::error_code ec;
+        fs::remove(tmp, ec);
     }
     {   // new defaults reach players who already have an ini: untouched old defaults move, changed ones stay, once
-        fs::path tmp = fs::temp_directory_path() / "dsr2_migrate_test.ini";
+        const std::string pid = std::to_string(GetCurrentProcessId());
+        fs::path tmp = fs::temp_directory_path() / ("dsr2_migrate_test_" + pid + ".ini");
         { std::ofstream o(tmp); o << "[General]\nDebug=0\n[Haptics]\nWeather=0.5\nGameRumble=0.35\n[Speaker]\nMechanics=1\n"; }
         Config cfg;
         cfg.load(tmp.wstring());
@@ -262,7 +287,8 @@ int run_selftests(const fs::path& data) {
         Config again;
         again.load(tmp.wstring());
         CHECK(again.str("Speaker", "Mechanics", "") == "1", "only once: a later choice of the old value stays");
-        fs::remove(tmp);
+        std::error_code ec;
+        fs::remove(tmp, ec);
     }
     {   // the in-game page: toggles and choices = option steppers (index), levels = whole percents
         Config cfg;
@@ -365,10 +391,21 @@ int run_selftests(const fs::path& data) {
               "shove (feedback) right before the rumble (vibration)");
         CHECK(std::count(modes.begin(), modes.end(), fx::VIBRATION) >= 25, "rumble lasts ~100 ms+");
     }
-    {   // bow
+    {   // bow: progressive solid feedback ramp up to full 8/8 at draw, release vs letdown
         Rig r(cat.resolve_name("WEAPON_BOW"));
-        r.pull(200, 10).hold(200, 1.2).release();
+        r.feed({0});
+        auto rz = fx::zones_of(r.frames.back().r2);
+        CHECK(r.frames.back().r2[0] == fx::FEEDBACK && rz[1] >= 3 && rz[9] == 8,
+              "bow ready ramps resistance across trigger travel");
+        r.pull(200, 10).hold(200, 1.2);
+        auto dz = fx::zones_of(r.frames.back().r2);
+        CHECK(r.frames.back().r2[0] == fx::FEEDBACK && dz[2] == 8 && dz[9] == 8,
+              "bow stays solid feedback at max 8/8 force at full draw");
+        r.release();
         CHECK(r.count("bow_release") == 1, "bow fires on release after a full draw");
+        Rig e(cat.resolve_name("WEAPON_BOW"));
+        e.pull(200, 10).hold(200, 0.1).release();
+        CHECK(e.count("bow_letdown") == 1 && e.count("bow_release") == 0, "early bow release lets down without firing");
     }
     {   // melee without the game: L2 = target
         nlohmann::json fist = cat.resolve_name("WEAPON_UNARMED");
@@ -380,11 +417,13 @@ int run_selftests(const fs::path& data) {
         m.feed({0}, R1).release(100);
         CHECK(m.count("punch_miss") == 1, "swing at air is a miss");
     }
-    {   // melee in game: the hit comes from real damage
+    {   // melee in game: R1 (cover/brake) does not swing; CIRCLE swings and the hit comes from real damage
         Rig r(cat.resolve_name("WEAPON_UNARMED"));
         r.hints.valid = true;
         r.hints.hip_fire = false;
-        r.feed({0}, R1).release(20);
+        r.feed({0}, R1).release(5);
+        CHECK(r.count("punch_swing") == 0, "R1 does not fire phantom melee in game");
+        r.feed({0}, CIRCLE).release(20);
         r.hints.melee_hits = 1;
         r.release(5);
         CHECK(r.count("punch_impact") + r.count("punch_impact_face") == 1, "game damage confirms the punch");
@@ -413,6 +452,59 @@ int run_selftests(const fs::path& data) {
         c.name = "hammer_cock";
         CHECK(lib.render(c, out) && out.size() > 100, "recipe renders");
         CHECK(lib.speaker_sound(c, out) && out.size() > 100, "speaker sound for a mechanism");
+        CHECK(HapticLibrary::speaker_category("hammer_cock") == SpeakerCategory::Mech &&
+              HapticLibrary::speaker_category("reload_round") == SpeakerCategory::Mech &&
+              HapticLibrary::speaker_category("reel_click") == SpeakerCategory::Mech &&
+              HapticLibrary::speaker_category("gun_draw") == SpeakerCategory::Mech &&
+              HapticLibrary::speaker_category("lasso_throw") == SpeakerCategory::Mech &&
+              HapticLibrary::speaker_category("impact_blade") == SpeakerCategory::Mech &&
+              HapticLibrary::speaker_category("deadeye_mark") == SpeakerCategory::UI &&
+              HapticLibrary::speaker_category("wheel_tick") == SpeakerCategory::UI &&
+              HapticLibrary::speaker_category("skin_cut") == SpeakerCategory::Ambient &&
+              HapticLibrary::speaker_category("ui_select") == SpeakerCategory::None &&
+              HapticLibrary::speaker_category("ui_nav") == SpeakerCategory::None &&
+              HapticLibrary::speaker_category("honor_up") == SpeakerCategory::None &&
+              HapticLibrary::speaker_category("horse_hitch") == SpeakerCategory::None &&
+              HapticLibrary::speaker_category("wood_chop_impact") == SpeakerCategory::None &&
+              HapticLibrary::speaker_category("chips") == SpeakerCategory::None &&
+              HapticLibrary::speaker_category("domino_clack") == SpeakerCategory::None &&
+              HapticLibrary::speaker_category("bow_release") == SpeakerCategory::None &&
+              HapticLibrary::speaker_category("brush") == SpeakerCategory::None &&
+              HapticLibrary::speaker_category("fire_crackle") == SpeakerCategory::None &&
+              HapticLibrary::speaker_category("step_wood") == SpeakerCategory::None &&
+              HapticLibrary::speaker_category("step_stone") == SpeakerCategory::None &&
+              HapticLibrary::speaker_category("shot_revolver") == SpeakerCategory::None &&
+              HapticLibrary::speaker_category("step_ground") == SpeakerCategory::None,
+              "speaker categories keep real recordings, gun/reel clicks, and silence noisy/UI cues");
+        for (const char* sr : {"hammer_cock", "gun_draw", "deadeye_mark", "reel_click", "wheel_tick", "skin_cut",
+                               "lasso_throw"}) {
+            Cue sc;
+            sc.name = sr;
+            CHECK(lib.speaker_sound(sc, out) && out.size() >= 16, sr);
+        }
+        for (const char* no_sr : {"ui_select", "ui_nav", "wood_chop_impact", "horse_hitch", "chips", "fire_crackle"}) {
+            Cue sc;
+            sc.name = no_sr;
+            CHECK(!lib.speaker_sound(sc, out), no_sr);
+        }
+        {
+            Stereo lo, hi, zero;
+            Cue qc;
+            qc.name = "deadeye_mark";
+            qc.gain = 0.2f;
+            bool ok_lo = lib.speaker_sound(qc, lo);
+            qc.gain = 1.2f;
+            bool ok_hi = lib.speaker_sound(qc, hi);
+            qc.gain = 0.0f;
+            bool ok_zero = lib.speaker_sound(qc, zero);
+            auto peak = [](const Stereo& b) {
+                float m = 0;
+                for (float s : b) m = std::max(m, std::fabs(s));
+                return m;
+            };
+            CHECK(ok_lo && ok_hi && !ok_zero && peak(hi) > peak(lo) * 3.0f,
+                  "speaker_sound scales by cue.gain and mutes zero gain");
+        }
         for (const char* r : {"hoof_dirt", "hoof_stone", "rail_clack", "hit_bullet", "gunfire_near", "shiver", "horse_heartbeat",
                               "land", "climb_grab", "door_open"}) {
             c.name = r;
@@ -446,8 +538,10 @@ int run_selftests(const fs::path& data) {
         c.variant = -1;
     }
     {   // surface teaching: cycles labels, persists, context fallbacks
-        fs::path tmp = fs::temp_directory_path() / "dsr2_materials_test.json";
-        fs::remove(tmp);
+        const std::string pid = std::to_string(GetCurrentProcessId());
+        fs::path tmp = fs::temp_directory_path() / ("dsr2_materials_test_" + pid + ".json");
+        std::error_code ec;
+        fs::remove(tmp, ec);
         Surfaces s;
         s.load(tmp);
         CHECK(s.classify(0x1234, false, 0, 0) == "ground", "unknown ground outdoors");
@@ -458,7 +552,7 @@ int run_selftests(const fs::path& data) {
         Surfaces again;
         again.load(tmp);
         CHECK(again.classify(0x1234, true, 0, 0) == "mud", "taught label saved and wins over context");
-        fs::remove(tmp);
+        fs::remove(tmp, ec);
     }
     {   // ground materials: joaat("<name>_<line in materials.dat>")
         CHECK(joaat("default_0") == 0x962C3F7B && joaat("concrete_1") == 0x46CA81E8, "material hash scheme (GTA V pairs)");
@@ -492,32 +586,151 @@ int run_selftests(const fs::path& data) {
         CHECK(s.classify(0x4FD0CB17, false, 0, 0) == "mud", "mud_soft under the boots = mud");
         CHECK(s.classify(0x4FD0CB17, false, 0, 0.8f) == "snow", "snow on top of it = snow");
     }
+    {   // DualSense trigger power-reduction, speaker mute, Catalog/Engine, and Haptic/LED features
+        DualSense ds;
+        OutputState os;
+        os.trigger_power_reduction = 5;
+        os.speaker_enabled = false;
+        uint8_t pl[47] = {};
+        ds.encode_payload(os, pl);
+        CHECK(pl[36] == (5 << 4), "trigger_power_reduction written to high nibble of byte 36");
+        CHECK((pl[0] & 0x20) && pl[5] == 0x00 && pl[7] == 0x00,
+              "speaker_enabled=false mutes hardware speaker volume (0x00) and disables internal speaker path");
+        os.speaker_enabled = true;
+        ds.encode_payload(os, pl);
+        CHECK((pl[0] & 0x20) && pl[5] == 0x64 && pl[7] == 0x30,
+              "speaker_enabled=true enables internal speaker path (0x30) and volume (0x64)");
+        uint8_t sample[4] = {0x31, 0x00, 0x10, 0x00};
+        CHECK(DualSense::bt_crc32(sample, 4) != 0, "bt_crc32 computes non-zero CRC");
+        // Davy lantern tool class + KickStrength=0 recoil suppression
+        std::string davy_name;
+        CHECK(cat.resolve(joaat("WEAPON_MELEE_DAVY_LANTERN"), 0, davy_name).value("type", "") == "tool" &&
+                  davy_name == "WEAPON_MELEE_DAVY_LANTERN",
+              "WEAPON_MELEE_DAVY_LANTERN resolves as tool");
+        {
+            Settings ks0;
+            ks0.manual_action = false;
+            ks0.kick_scale = 0.0f;
+            Rig rk(catt, ks0);
+            rk.pull().hold(255, 0.08);
+            bool any_kick = false;
+            for (const auto& f : rk.frames)
+                if (f.r2[0] == fx::VIBRATION) any_kick = true;
+            CHECK(!any_kick && rk.shots_rt() == 1, "KickStrength=0 emits shot without trigger recoil vibration");
+        }
+        // environmental, mount, pluck, blast trigger shock, health/wanted LEDs, and nearby trains
+        HapticLibrary hlib;
+        hlib.load(data / "haptics.json", nullptr);
+        CHECK(hlib.has("hail_drop") && hlib.has("wind_gust") && hlib.has("thunder_roll") &&
+              hlib.has("train_pass") && hlib.has("carry_shift") && hlib.has("pluck") &&
+              hlib.has("horse_mount") && hlib.has("wagon_mount") &&
+              hlib.has("step_wood") && hlib.has("step_stone") && hlib.has("hoof_wood") && hlib.has("hoof_stone"),
+              "environmental, mount, pluck, and terrain haptic recipes loaded");
+        CHECK(!hlib.has("holster_draw") &&
+              !hlib.has("wood_chop_swing") && !hlib.has("wood_chop_impact") && !hlib.has("wood_stack") &&
+              !hlib.has("fire_crackle") && !hlib.has("wagon_bump") && !hlib.has("slip_slide") &&
+              !hlib.has("horse_hitch") && !hlib.has("ui_select") && !hlib.has("ui_nav") &&
+              !hlib.has("ui_back") && !hlib.has("ui_tab"),
+              "removed/orphan recipes are absent from haptics.json");
+        Features feat;
+        feat.configure();
+        InputState in; in.t = 10.0;
+        GameSnapshot gs; gs.valid = true; gs.blocked = false; gs.halted = false;
+        gs.health_core = 100;
+        OutputState out;
+        std::vector<Cue> cues;
+        std::vector<WorldEvent> evs = {{WorldEvent::Life, 0.35f, 1.0f, "pluck"},
+                                       {WorldEvent::Horse, 0.0f, 1.0f, "mount"},
+                                       {WorldEvent::Life, 0.0f, 1.0f, "wagon_mount"},
+                                       {WorldEvent::Explosion, 0.0f, 0.9f, "blast"}};
+        feat.update(in, gs, evs, nullptr, false, -1, 0, false, out, cues);
+        bool has_pl = false, has_hm = false, has_wm = false;
+        for (const auto& c : cues) {
+            if (c.name == "pluck") has_pl = true;
+            if (c.name == "horse_mount") has_hm = true;
+            if (c.name == "wagon_mount") has_wm = true;
+        }
+        CHECK(has_pl && has_hm && has_wm, "pluck, horse mount, and wagon mount emit dedicated cues");
+        CHECK(out.r2[0] == fx::VIBRATION && out.l2[0] == fx::VIBRATION,
+              "close blast applies brief shudder to both triggers");
+        CHECK(out.player_leds == 0, "health LEDs stay off when health has not changed");
+        // when health changes, show LEDs for 3.5 s, then turn off again
+        gs.health_core = 60;
+        in.t = 10.5; cues.clear(); out = OutputState{};
+        feat.update(in, gs, {}, nullptr, false, -1, 0, false, out, cues);
+        CHECK(out.player_leds == 0x15, "health change lights up player LEDs (60% = 3 LEDs)");
+        in.t = 14.5; cues.clear(); out = OutputState{};
+        feat.update(in, gs, {}, nullptr, false, -1, 0, false, out, cues);
+        CHECK(out.player_leds == 0, "health LEDs turn off again 3.5 s after health change");
+        // wanted: police-light LED sweep + escalating heartbeat
+        gs.wanted = true; gs.wanted_score = 400;
+        cues.clear(); out = OutputState{};
+        feat.update(in, gs, {}, nullptr, false, -1, 0, false, out, cues);
+        CHECK(out.player_leds == 0x03 || out.player_leds == 0x18, "wanted mode animates police-light player LEDs");
+        bool has_hb = false;
+        for (const auto& c : cues) if (c.name == "heartbeat") has_hb = true;
+        CHECK(has_hb, "wanted mode emits tension heartbeat");
+        // nearby moving train (monotonically increasing timestamps)
+        gs.wanted = false;
+        gs.near_train_dist = 10.0f; gs.near_train_speed = 12.0f; gs.near_train_pan = 0.5f;
+        in.t = 15.0; cues.clear(); out = OutputState{};
+        feat.update(in, gs, {}, nullptr, false, -1, 0, false, out, cues);
+        in.t = 15.05;
+        feat.update(in, gs, {}, nullptr, false, -1, 0, false, out, cues);
+        bool has_train = false;
+        for (const auto& c : cues) {
+            if (c.name == "train_pass") has_train = true;
+        }
+        CHECK(has_train, "nearby moving train emits directional haptics");
+        // LedMode::Off outputs 0 and Lightbar.Enabled=0 keeps writing black (never stuck on flash)
+        const std::string pid = std::to_string(GetCurrentProcessId());
+        fs::path tmp_ini = fs::temp_directory_path() / ("dsr2_feat_off_" + pid + ".ini");
+        { std::ofstream o(tmp_ini); o << "[Lightbar]\nEnabled=0\nPlayerLeds=off\n"; }
+        config().load(tmp_ini.wstring());
+        Features feat_off;
+        feat_off.configure();
+        in.t = 16.0; cues.clear(); out = OutputState{};
+        feat_off.update(in, gs, {}, nullptr, false, -1, 0, false, out, cues);
+        CHECK(out.player_leds == 0 && out.has_lightbar && out.r == 0 && out.g == 0 && out.b == 0,
+              "LedMode::Off forces player_leds=0 and Lightbar.Enabled=0 outputs black");
+        in.t = 16.5; cues.clear(); out = OutputState{};
+        feat_off.update(in, gs, {}, nullptr, false, -1, 0, false, out, cues);
+        CHECK(out.has_lightbar && out.r == 0 && out.g == 0 && out.b == 0,
+              "Lightbar.Enabled=0 keeps writing off so external flashes never stick");
+        { std::ofstream o(tmp_ini); o << Config::default_text(); }
+        config().load(tmp_ini.wstring());
+        std::error_code ec;
+        fs::remove(tmp_ini, ec);
+    }
     {   // the XInput hook, exactly as the game calls it
         CHECK(input().install_hook(), "hook xinput9_1_0");
         using GetFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
         using SetFn = DWORD(WINAPI*)(DWORD, XINPUT_VIBRATION*);
         HMODULE x = GetModuleHandleW(L"xinput9_1_0.dll");
-        auto get = reinterpret_cast<GetFn>(GetProcAddress(x, "XInputGetState"));
-        auto set = reinterpret_cast<SetFn>(GetProcAddress(x, "XInputSetState"));
-        InputState s;
-        s.buttons = CROSS | DPAD_LEFT;
-        s.r2 = 120;
-        s.l2 = 77;
-        s.lx = 255;
-        s.ly = 0;
-        input().publish(s, 255, true);
-        XINPUT_STATE st{};
-        CHECK(get(0, &st) == ERROR_SUCCESS, "pad 0 connected");
-        CHECK((st.Gamepad.wButtons & XINPUT_GAMEPAD_A) && (st.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT), "buttons mapped");
-        CHECK(st.Gamepad.bRightTrigger == 255 && st.Gamepad.bLeftTrigger == 77, "RT from the engine, LT raw");
-        CHECK(st.Gamepad.sThumbLX > 32000 && st.Gamepad.sThumbLY > 32000, "stick up/right");
-        CHECK(get(1, &st) == ERROR_DEVICE_NOT_CONNECTED, "other pads hidden");
-        input().inject(XINPUT_GAMEPAD_DPAD_UP, 0.2);
-        input().publish(s, -1, true);
-        get(0, &st);
-        CHECK((st.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_UP) && st.Gamepad.bRightTrigger == 120, "whistle injection, RT passthrough");
-        XINPUT_VIBRATION v{65535, 32768};
-        CHECK(set(0, &v) == ERROR_SUCCESS && input().rumble_low() > 0.99f && input().rumble_high() > 0.49f, "game rumble captured");
+        auto get = x ? reinterpret_cast<GetFn>(GetProcAddress(x, "XInputGetState")) : nullptr;
+        auto set = x ? reinterpret_cast<SetFn>(GetProcAddress(x, "XInputSetState")) : nullptr;
+        CHECK(x && get && set, "xinput9_1_0 exports resolved");
+        if (get && set) {
+            InputState s;
+            s.buttons = CROSS | DPAD_LEFT;
+            s.r2 = 120;
+            s.l2 = 77;
+            s.lx = 255;
+            s.ly = 0;
+            input().publish(s, 255, true);
+            XINPUT_STATE st{};
+            CHECK(get(0, &st) == ERROR_SUCCESS, "pad 0 connected");
+            CHECK((st.Gamepad.wButtons & XINPUT_GAMEPAD_A) && (st.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT), "buttons mapped");
+            CHECK(st.Gamepad.bRightTrigger == 255 && st.Gamepad.bLeftTrigger == 77, "RT from the engine, LT raw");
+            CHECK(st.Gamepad.sThumbLX == 32767 && st.Gamepad.sThumbLY > 32000, "stick up/right full range");
+            CHECK(get(1, &st) == ERROR_DEVICE_NOT_CONNECTED, "other pads hidden");
+            input().inject(XINPUT_GAMEPAD_DPAD_UP, 0.2);
+            input().publish(s, -1, true);
+            get(0, &st);
+            CHECK((st.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_UP) && st.Gamepad.bRightTrigger == 120, "whistle injection, RT passthrough");
+            XINPUT_VIBRATION v{65535, 32768};
+            CHECK(set(0, &v) == ERROR_SUCCESS && input().rumble_low() > 0.99f && input().rumble_high() > 0.49f, "game rumble captured");
+        }
     }
     printf("selftest: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

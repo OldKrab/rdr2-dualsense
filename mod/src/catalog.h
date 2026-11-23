@@ -3,7 +3,7 @@
 
 #include "common.h"
 
-#include <map>
+#include <unordered_map>
 
 #include "../third_party/json.hpp"
 
@@ -17,8 +17,8 @@ public:
     nlohmann::json resolve_name(const std::string& name) const;
 
 private:
-    nlohmann::json raw_;
-    std::map<uint32_t, std::string> by_hash_;
+    std::unordered_map<std::string, nlohmann::json> by_name_;
+    std::unordered_map<uint32_t, std::string> by_hash_;
 };
 
 nlohmann::json deep_merge(nlohmann::json base, const nlohmann::json& over);

@@ -7,7 +7,7 @@
 #include "shv.h"
 #include "text_inject.h"
 
-#include <thread>
+#include <atomic>
 
 static HMODULE g_module = nullptr;
 
@@ -18,6 +18,23 @@ fs::path module_dir() {
     return fs::path(path).parent_path();
 }
 }  // namespace dsr2
+
+static std::atomic<bool> g_started{false};
+static HANDLE g_boot_thread = nullptr;
+
+static DWORD WINAPI boot_thread(LPVOID) {
+    try {
+        dsr2::core().init(true);
+        g_started.store(true, std::memory_order_release);
+        if (dsr2::config().flag("General", "Probes", false)) dsr2::io_probe_start();
+        dsr2::text_inject_start();
+    } catch (const std::exception& e) {
+        LOGE("init failed: %s", e.what());
+    } catch (...) {
+        LOGE("init failed: unknown exception");
+    }
+    return 0;
+}
 
 static void script_main() {
     while (true) {
@@ -30,22 +47,37 @@ static void script_main() {
     }
 }
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID lpReserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_module = module;
         DisableThreadLibraryCalls(module);
         dsr2::log::open((dsr2::module_dir() / "DualSenseRDR2.log").wstring());
         LOGI("DualSense for RDR2 %s - loading", dsr2::kVersion);
-        // Controller, audio and the XInput hook start right away (menus work too);
-        // game state comes from the ScriptHook script once a save is loaded.
-        std::thread([] {
-            dsr2::core().init(true);
-            if (dsr2::config().flag("General", "Probes", false)) dsr2::io_probe_start();   // research: which audio files the game reads
-        }).detach();
-        dsr2::text_inject_start();       // our Settings texts, in the game's own string table
         shv_scriptRegister(module, script_main);
+        g_boot_thread = CreateThread(nullptr, 0, boot_thread, nullptr, 0, nullptr);
+        if (!g_boot_thread) LOGE("boot thread creation failed (%lu)", GetLastError());
     } else if (reason == DLL_PROCESS_DETACH) {
         shv_scriptUnregister(module);
+        // Only clean up on explicit FreeLibrary (lpReserved == nullptr) when boot_thread is not still running
+        // (avoids Loader Lock deadlock on FreeLibrary). Never acquire locks on process exit (lpReserved != nullptr).
+        if (!lpReserved) {
+            bool boot_done = !g_boot_thread || WaitForSingleObject(g_boot_thread, 0) == WAIT_OBJECT_0;
+            if (g_boot_thread) {
+                CloseHandle(g_boot_thread);
+                g_boot_thread = nullptr;
+            }
+            if (boot_done) {
+                if (g_started.load(std::memory_order_acquire)) {
+                    dsr2::text_inject_stop();
+                    dsr2::io_probe_stop();
+                    dsr2::core().shutdown();
+                }
+                dsr2::log::close();
+            }
+        } else if (g_boot_thread) {
+            CloseHandle(g_boot_thread);
+            g_boot_thread = nullptr;
+        }
     }
     return TRUE;
 }

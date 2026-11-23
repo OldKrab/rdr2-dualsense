@@ -5,6 +5,9 @@
 namespace dsr2::dsp {
 
 Biquad Biquad::lowpass(float hz, float q, float sr) {
+    if (sr <= 0) sr = kSR;
+    hz = clampv(hz, 1.0f, sr * 0.45f);
+    q = std::max(0.05f, q);
     float w = 2 * kPi * hz / sr, c = std::cos(w), s = std::sin(w), alpha = s / (2 * q);
     float a0 = 1 + alpha;
     Biquad b;
@@ -14,6 +17,9 @@ Biquad Biquad::lowpass(float hz, float q, float sr) {
 }
 
 Biquad Biquad::highpass(float hz, float q, float sr) {
+    if (sr <= 0) sr = kSR;
+    hz = clampv(hz, 1.0f, sr * 0.45f);
+    q = std::max(0.05f, q);
     float w = 2 * kPi * hz / sr, c = std::cos(w), s = std::sin(w), alpha = s / (2 * q);
     float a0 = 1 + alpha;
     Biquad b;
@@ -36,7 +42,7 @@ const Preset& preset(const std::string& name) {
 }
 
 std::vector<float> resample(const float* x, size_t n, int sr) {
-    if (sr == kSR || n == 0) return std::vector<float>(x, x + n);
+    if (sr <= 0 || sr == kSR || n == 0) return std::vector<float>(x, x + n);
     size_t m = size_t(double(n) * kSR / sr);
     std::vector<float> out(m);
     double step = double(sr) / kSR;
@@ -105,7 +111,7 @@ std::vector<float> to_haptic(const std::vector<float>& mono, int sr, const Prese
     for (size_t i = 0; i < x.size(); ++i) trans[i] = std::max(0.0f, fast[i] - slow[i]);
     float tp = std::max(1e-6f, peak(trans)), fp = std::max(1e-6f, peak(fast));
 
-    float hold = p.hold_ms / 1000, tail = p.tail_ms / 1000;
+    float hold = p.hold_ms / 1000, tail = std::max(1e-4f, p.tail_ms / 1000);
     std::vector<float> h(x.size());
     size_t last = 0;
     for (size_t i = 0; i < x.size(); ++i) {
@@ -118,9 +124,10 @@ std::vector<float> to_haptic(const std::vector<float>& mono, int sr, const Prese
     }
     h.resize(last + 1);
     float hp = std::max(1e-6f, peak(h));
-    float td = std::tanh(p.drive);
+    float drive = std::max(0.05f, p.drive);
+    float td = std::tanh(drive);
     Band clean(15, 300);
-    for (auto& s : h) s = clean.run(std::tanh(p.drive * s / hp) / td);
+    for (auto& s : h) s = clean.run(std::tanh(drive * s / hp) / td);
     hp = std::max(1e-6f, peak(h));
     size_t fade = std::min(h.size(), size_t(kSR / 200));
     for (size_t i = 0; i < h.size(); ++i) {
@@ -170,6 +177,7 @@ void StreamConverter::process(float l, float r, float& hl, float& hr) {
     float in[2] = {l, r}, out[2];
     float level = std::max(std::fabs(l), std::fabs(r));
     float norm = std::max(0.02f, agc_.run(level));         // slow AGC: consistent feel at any volume
+    const float sin_c = std::sin(phase_c_), sin_r = std::sin(phase_r_);
     for (int c = 0; c < 2; ++c) {
         Chan& ch = ch_[c];
         float x = in[c] / norm;
@@ -178,7 +186,7 @@ void StreamConverter::process(float l, float r, float& hl, float& hr) {
         // only what rises above the ambient bed (music, wind, crowd) becomes haptics
         float event = clampv((f - 1.6f * bed) / std::max(f, 1e-4f), 0.0f, 1.0f);
         float trans = std::max(0.0f, f - s);
-        float y = body * event * 0.9f + std::sin(phase_c_) * trans * 0.8f + std::sin(phase_r_) * std::max(0.0f, f - 1.6f * bed) * 0.35f;
+        float y = body * event * 0.9f + sin_c * trans * 0.8f + sin_r * std::max(0.0f, f - 1.6f * bed) * 0.35f;
         y = std::tanh(1.8f * y);
         out[c] = ch.out2.run(ch.out1.run(ch.hp.run(y)));
     }

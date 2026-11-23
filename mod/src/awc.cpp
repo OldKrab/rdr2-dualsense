@@ -127,6 +127,7 @@ uint64_t header_fingerprint(const std::vector<uint8_t>& h) {
 bool read_header(const File& f, uint64_t file, std::vector<uint8_t>& h) {
     if (!f.read_exact(file, h, 16) || std::memcmp(h.data(), "ADAT", 4)) return false;
     uint32_t count = rd<uint32_t>(&h[8]), hsize = rd<uint32_t>(&h[12]);
+    if (count == 0 || count > 100000) return false;
     size_t n = std::max<size_t>(hsize, 16 + 6 * size_t(count) + 64 * size_t(count));   // hsize can be 0 in odd files
     n = std::min<size_t>(n, 64u << 20);
     if (!f.read_exact(file, h, n)) {
@@ -155,6 +156,7 @@ void ogg_page(std::vector<uint8_t>& o, const std::vector<std::pair<const uint8_t
             lace.push_back(255);
         }
     }
+    if (lace.size() > 255) return;
     size_t start = o.size();
     const uint8_t head[] = {'O', 'g', 'g', 'S', 0, flags};
     o.insert(o.end(), head, head + 6);

@@ -20,8 +20,9 @@ public:
 
 private:
     void loop(std::vector<std::string> phrases, float min_conf);
+    std::mutex mu_;
     std::thread thread_;
-    std::atomic<bool> running_{false}, listening_{true};
+    std::atomic<bool> running_{false}, listening_{true}, enabled_{false};
     Handler handler_;
     std::vector<std::string> phrases_;
     float min_conf_ = 0.35f;

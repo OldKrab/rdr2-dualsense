@@ -11,15 +11,30 @@
 
 #include "common.h"
 
+#include <condition_variable>
+#include <deque>
 #include <map>
-#include <memory>
 #include <mutex>
 #include <set>
+#include <thread>
+#include <unordered_map>
 
 namespace dsr2 {
 
 class Surfaces {
 public:
+    ~Surfaces() {
+        std::thread w;
+        {
+            std::lock_guard<std::mutex> l(mu_);
+            stop_ = true;
+            shutting_down_ = true;
+            w = std::move(worker_);
+        }
+        cv_.notify_all();
+        if (w.joinable()) w.detach();
+    }
+    void shutdown();
     static const std::vector<std::string>& labels();   // ground grass mud stone gravel wood snow sand water
     void load(const fs::path& json);
     // a material seen for the first time is identified in the background (a few ms); until then: context
@@ -34,13 +49,17 @@ public:
 
 private:
     void save() const;
+    void start_worker();
     fs::path path_;
     std::map<uint32_t, std::string> taught_;
-    struct Found {
-        std::mutex mu;
-        std::map<uint32_t, std::string> names;           // "" = searched, no match
-    };
-    std::shared_ptr<Found> found_ = std::make_shared<Found>();
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<uint32_t> queue_;
+    std::map<uint32_t, std::string> names_;            // "" = searched, no match
+    std::unordered_map<uint32_t, std::string> label_cache_;  // script-thread fast cache
+    std::thread worker_;
+    bool stop_ = false;
+    bool shutting_down_ = false;
     std::set<uint32_t> asked_;
 };
 

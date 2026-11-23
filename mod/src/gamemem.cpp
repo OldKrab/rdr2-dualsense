@@ -9,12 +9,12 @@ namespace {
 struct SpeechRoots {
     uintptr_t lo = 0, tab = 0;          // globals: u32 index base, table pointer
     uint32_t comp = 0, flag = 0, a98 = 0, mgr = 0;
-    bool ok = false;
+    std::atomic<bool> ok{false};
 } g_sp;
 
 struct PoolRoots {
     uintptr_t global = 0;
-    bool ok = false;
+    std::atomic<bool> ok{false};
 } g_pool;
 
 std::once_flag g_once;
@@ -26,7 +26,8 @@ struct Pattern {
         for (const char* p = s; *p;) {
             while (*p == ' ') ++p;
             if (!*p) break;
-            if (p[0] == '?') { bytes.push_back(-1); p += 2; continue; }
+            if (p[0] == '?') { bytes.push_back(-1); p += (p[1] == '?') ? 2 : 1; continue; }
+            if (!p[1]) break;
             bytes.push_back(int(strtol(std::string(p, 2).c_str(), nullptr, 16)));
             p += 2;
         }
@@ -35,13 +36,14 @@ struct Pattern {
 
 std::vector<uintptr_t> scan(const Pattern& pat) {
     std::vector<uintptr_t> hits;
+    if (pat.bytes.empty()) return hits;
     auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
     auto sec = IMAGE_FIRST_SECTION(nt);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
-        // only .text: the same range game_files.cpp scans (other executable sections may hold guard pages)
-        if (std::memcmp(sec->Name, ".text", 5) != 0) continue;
+        // exact ".text" section name (avoid matching ".textbss" etc.)
+        if (std::strncmp(reinterpret_cast<const char*>(sec->Name), ".text", 8) != 0) continue;
         auto lo = reinterpret_cast<const uint8_t*>(base + sec->VirtualAddress);
         size_t n = sec->Misc.VirtualSize, m = pat.bytes.size();
         if (n < m) continue;
@@ -84,12 +86,14 @@ void find_roots() {
         r.flag = u32_at(a + 56);
         r.a98 = u32_at(a + 66);
         r.mgr = u32_at(a + 73);
-        if (a == hs[0]) g_sp = r;
-        else if (r.lo != g_sp.lo || r.tab != g_sp.tab || r.comp != g_sp.comp || r.flag != g_sp.flag || r.a98 != g_sp.a98 ||
+        if (a == hs[0]) {
+            g_sp.lo = r.lo; g_sp.tab = r.tab; g_sp.comp = r.comp; g_sp.flag = r.flag; g_sp.a98 = r.a98; g_sp.mgr = r.mgr;
+        } else if (r.lo != g_sp.lo || r.tab != g_sp.tab || r.comp != g_sp.comp || r.flag != g_sp.flag || r.a98 != g_sp.a98 ||
                  r.mgr != g_sp.mgr)
             agree = false;
     }
-    g_sp.ok = agree && g_sp.mgr > 0 && g_sp.mgr < 0x100000;
+    const bool sp_ok = agree && g_sp.mgr > 0 && g_sp.mgr < 0x100000;
+    g_sp.ok.store(sp_ok, std::memory_order_release);
     // sound pool: the sound base class destructor
     static const Pattern pl("0F AF 15 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 49 69 C9 60 A8 02 00 48 03 94 01 48 A8 02 00");
     auto hp = scan(pl);
@@ -99,15 +103,15 @@ void find_roots() {
         if (a == hp[0]) g_pool.global = g;
         else if (g != g_pool.global) agree = false;
     }
-    g_pool.ok = agree;
+    g_pool.ok.store(agree, std::memory_order_release);
     uintptr_t exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    LOGI("game audio state: speech %s (%zu signatures), sound pool %s (%zu) - %.0f ms", g_sp.ok ? "found" : "NOT found",
-         hs.size(), g_pool.ok ? "found" : "NOT found", hp.size(), (now_s() - t0) * 1000);
-    if (g_sp.ok)
+    LOGI("game audio state: speech %s (%zu signatures), sound pool %s (%zu) - %.0f ms", sp_ok ? "found" : "NOT found",
+         hs.size(), agree ? "found" : "NOT found", hp.size(), (now_s() - t0) * 1000);
+    if (sp_ok)
         LOGD("speech roots: exe+0x%llX / exe+0x%llX, +0x%X +0x%X +0x%X +0x%X", (unsigned long long)(g_sp.lo - exe),
              (unsigned long long)(g_sp.tab - exe), g_sp.comp, g_sp.flag, g_sp.a98, g_sp.mgr);
-    if (g_pool.ok) LOGD("sound pool root: exe+0x%llX", (unsigned long long)(g_pool.global - exe));
-    g_any = g_sp.ok || g_pool.ok;
+    if (agree) LOGD("sound pool root: exe+0x%llX", (unsigned long long)(g_pool.global - exe));
+    g_any = sp_ok || agree;
 }
 
 }  // namespace
@@ -116,8 +120,8 @@ bool init() {
     std::call_once(g_once, find_roots);
     return g_any;
 }
-bool speech_ok() { return g_sp.ok; }
-bool pool_ok() { return g_pool.ok; }
+bool speech_ok() { return g_sp.ok.load(std::memory_order_acquire); }
+bool pool_ok() { return g_pool.ok.load(std::memory_order_acquire); }
 
 bool read(uintptr_t a, void* out, size_t n) {
     SIZE_T got = 0;

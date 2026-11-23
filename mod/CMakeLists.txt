@@ -20,24 +20,27 @@ set(SYSTEM_LIBS setupapi hid ole32 uuid avrt winmm)
 find_program(DLLTOOL dlltool REQUIRED)
 set(SHV_LIB ${CMAKE_BINARY_DIR}/libScriptHookRDR2.a)
 add_custom_command(OUTPUT ${SHV_LIB}
-    COMMAND ${DLLTOOL} -d ${CMAKE_SOURCE_DIR}/scripthook/ScriptHookRDR2.def -l libScriptHookRDR2.a -m i386:x86-64
+    COMMAND ${DLLTOOL} -d ${CMAKE_CURRENT_SOURCE_DIR}/scripthook/ScriptHookRDR2.def -l libScriptHookRDR2.a -m i386:x86-64
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}     # relative name: dlltool puts it into the stub symbols
-    DEPENDS ${CMAKE_SOURCE_DIR}/scripthook/ScriptHookRDR2.def)
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/scripthook/ScriptHookRDR2.def)
 add_custom_target(shv_import DEPENDS ${SHV_LIB})
 
 add_library(DualSenseRDR2 SHARED ${CORE_SOURCES} src/world.cpp src/settings_ui.cpp src/text_inject.cpp src/io_probe.cpp src/main.cpp)
 add_dependencies(DualSenseRDR2 shv_import)
 set_target_properties(DualSenseRDR2 PROPERTIES PREFIX "" SUFFIX ".asi")
-target_link_options(DualSenseRDR2 PRIVATE -s)     # no symbols in the shipped .asi
+target_link_options(DualSenseRDR2 PRIVATE $<$<CONFIG:Release>:-s>)     # strip symbols only in Release
 target_link_libraries(DualSenseRDR2 PRIVATE ${SHV_LIB} ${SYSTEM_LIBS})
 
 add_executable(dsr2_test ${CORE_SOURCES} src/world_stub.cpp src/standalone.cpp src/selftest.cpp)
 target_link_libraries(dsr2_test PRIVATE ${SYSTEM_LIBS})
 
 # the test program reads the same data the mod ships (tools/trigger_lab/data), synced on every build
-set(LAB_DATA ${CMAKE_SOURCE_DIR}/../tools/trigger_lab/data)
+set(LAB_DATA ${CMAKE_CURRENT_SOURCE_DIR}/../tools/trigger_lab/data)
 add_custom_target(test_data ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/DualSenseRDR2
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LAB_DATA}/haptics.json ${LAB_DATA}/weapons.json
             ${LAB_DATA}/sound_labels.json ${LAB_DATA}/speech_voices.txt ${CMAKE_BINARY_DIR}/DualSenseRDR2/)
 add_dependencies(dsr2_test test_data)
+
+enable_testing()
+add_test(NAME selftest COMMAND dsr2_test --selftest)

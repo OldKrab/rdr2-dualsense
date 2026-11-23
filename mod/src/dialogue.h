@@ -37,7 +37,7 @@ public:
     bool speech_wanted() const { return speech_gain_ > 0 && !cutscenes_only_ && running_; }
     // script thread, every frame: who is near (only read when speech vibration is on). native_player_line = the
     // game's _GET_LAST_PLAYED_SPEECH_FOR_PED for the player, to check the memory layout against the game itself.
-    void game_tick(const std::vector<Talker>& talkers, uint32_t native_player_line);
+    void game_tick(const std::vector<Talker>& talkers, uint32_t native_player_line, bool halted = false, bool cutscene = false);
 
 private:
     void worker();
@@ -66,9 +66,11 @@ private:
     std::string out_name_;                           // worker only
     std::atomic<bool> enabled_{true};
 
-    std::mutex mu_;                                  // jobs between the script thread and the worker
+    std::mutex mu_;                                  // jobs and active_keys_ between the script thread and the worker
     std::condition_variable cv_;
     std::deque<LineJob> line_jobs_;
+    std::unordered_set<uint64_t> active_keys_;       // prevents cancelled lines from playing 30 s later
+    std::atomic<bool> in_cutscene_{false}, halted_{false};
 
     // worker-only state
     std::unordered_set<uint32_t> cut_ids_;           // every cutscene channel id

@@ -35,7 +35,11 @@ private:
     void confirm();
     void build_engine(const nlohmann::json& profile, const std::string& name);
 
-    bool in_game_ = false;
+    std::atomic<bool> in_game_{false}, initialized_{false}, enabled_{false}, shutting_down_{false};
+    std::atomic<int> reload_key_{120};
+    std::atomic<float> wheel_click_gain_{0.6f};
+    std::thread reconnect_thread_;
+    std::mutex reconnect_mu_;
     double next_slot_check_ = 0;          // on_input: next look at the game's pad slot
     double ps_since_ = -1;                // PS held since (hold ~1 s = reload)
     double fight_until_ = 0;              // shots / hits lately: the everyday textures step back
@@ -66,7 +70,8 @@ private:
     std::string engine_name_;
     std::map<std::string, int> learned_break_;
     std::atomic<bool> reload_requested_{false};
-    bool speaker_mechanics_ = true;
+    std::atomic<bool> speaker_mechanics_{false};
+    std::atomic<bool> speaker_ambient_{true}, speaker_ui_{true};
     std::vector<std::string> voice_greet_, voice_calm_, voice_stop_, voice_spur_;
     std::string voice_key_;           // the voice settings the recognizer runs with (restarted when they change)
     std::atomic<bool> whistle_on_{false};
