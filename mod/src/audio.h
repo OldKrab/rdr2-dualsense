@@ -116,7 +116,7 @@ private:
     std::atomic<size_t> ring_w_{0}, ring_r_{0};
     std::function<void()> on_whistle_;
     std::atomic<float> mic_level_{0};
-    std::atomic<float> cooldown_s_{1.2f}, mic_sens_{1.0f};
+    std::atomic<float> cooldown_s_{3.0f}, mic_sens_{1.0f};
   public:
     // a recognition happened: the controller thread flashes the lightbar until this time
     std::atomic<double> ack_flash_until{0};

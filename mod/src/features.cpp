@@ -30,9 +30,10 @@ void Features::configure() {
     if (was_lb && !lightbar_on_) lightbar_off_sent_ = false;
     brightness_ = c.num("Lightbar", "Brightness", 1.0f);
     ammo_leds_ = c.flag("Lightbar", "AmmoLeds", true);
-    std::string lm = c.str("Lightbar", "PlayerLeds", "auto");
+    std::string lm = c.str("Lightbar", "PlayerLeds", "");
+    if (lm.empty()) lm = ammo_leds_ ? "auto" : "off";      // an ini from before PlayerLeds
     for (char& ch : lm) ch = char(std::tolower(static_cast<unsigned char>(ch)));
-    if (!ammo_leds_ || lm == "off" || lm == "0") led_mode_ = LedMode::Off;
+    if (lm == "off" || lm == "0") led_mode_ = LedMode::Off;
     else if (lm == "health") led_mode_ = LedMode::Health;
     else if (lm == "ammo") led_mode_ = LedMode::Ammo;
     else led_mode_ = LedMode::Auto;

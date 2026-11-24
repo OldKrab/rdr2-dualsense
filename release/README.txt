@@ -56,8 +56,8 @@ Fishing    R2 progressively loads the cast, pulses on release, and tugs when a f
            L2 - the rod grip - carries the real line tension and strains right before the line snaps. You feel
            the fish surge left / right, the reel click, and the catch flapping in your hand.
 Lasso      Both L2 and R2 stiffen while holding a roped target, with rope tension, jerks and struggle vibration.
-Bow        Heavy progressive resistance across R2 travel up to full 8/8 force at full draw, staged wood creaks,
-           high-force arm strain after holding too long, early letdown vs. full arrow release.
+Bow        R2 gets heavier the further you draw, the wood creaks as it bends, your arm strains if you hold
+           too long; letting the string down early feels different from loosing the arrow.
 Melee      Fists, knives and melee weapons have trigger feedback on swings, blocks and hits, with a heavier
            dual-trigger impact when landing a knockout or final blow.
 Horse      Hoofbeats from the real hooves at every gait, on the real ground (mud, gravel, wood, grass, snow...),
@@ -75,8 +75,7 @@ Explosions From where and how far they go off, with the real blast; close ones s
 Weather    Rain and hail drops on the hat, storm/blizzard wind gusts, and distant thunder rolls.
 Fights     While shots fly, steps, hooves and rain step back so the fight comes through.
 Cutscenes  Steps, hooves, shots and hits are felt in cutscenes too.
-Menus      Adaptive triggers stay completely relaxed and controller haptics/speaker output stay silent in main
-           menus, pause menus, and loading screens.
+Menus      Triggers go slack and the controller goes quiet in the main menu, the pause menu and loading screens.
 Dialogue   (experimental, off by default) Every spoken line as the speaker's voice in your hands - see below.
 Honor      A warm swell and gold glow when honor rises, a sinking thud when it falls.
 Camp life  Bites, sips and puffs, cleaning your gun, brushing / feeding the horse, skinning, stowing pelts,
@@ -84,12 +83,11 @@ Camp life  Bites, sips and puffs, cleaning your gun, brushing / feeding the hors
 Table games Five finger fillet (every stab - and the miss), poker and blackjack chips and cards, dominoes.
 Weapon wheel L2/R2 click like a selector switch while you browse.
 Lightbar   Muzzle flash, hits, Dead Eye, lantern flicker, wanted police flash, low health, time of day.
-           Player LEDs show rounds left when armed, appear for 3.5 s whenever health changes (PlayerLeds=auto|health|ammo|off),
-           and animate a police-light sweep when wanted.
-Speaker    Focused controller speaker audio (off by default: Sounds from the Controller): authentic in-game
-           recordings (weapon draw / holster, lasso throw & rope jerks, bow creak, blade impacts & skinning)
-           plus crisp mechanical clicks (cocking, lever / bolt / pump actions, live per-round reloads, dry fire,
-           fishing reel clicks, weapon wheel & Dead Eye marks). Turning it off enforces a real hardware mute.
+           Player LEDs (under the touchpad): rounds left while armed, your health for a few seconds when it
+           changes, a police sweep while you're wanted.
+Speaker    (off by default: Sounds from the Controller) The game's own sounds for drawing and holstering, the
+           lasso, the bow and blades, and clicks for cocking, every round you load, dry fire, the reel, the
+           weapon wheel and Dead Eye marks. Off mutes the speaker completely.
 
 
 DIALOGUE HAPTICS (experimental, off by default)
@@ -129,6 +127,8 @@ Debug=1 writes details to DualSenseRDR2.log - attach it when reporting a problem
 
 CREDITS
 -------
+TochaRude (https://github.com/TochaRude): the bow, lasso, fists, mounting, trains, weather, carrying and the
+player LED modes of 1.4.0, the speaker's game sounds, and many fixes.
 Game research: alloc8or's RDR3 native database, femga's rdr3_discoveries, Halen84 and others' decompiled
 script references. nlohmann/json (MIT). stb_vorbis by Sean Barrett (public domain). Script Hook RDR2 by
 Alexander Blade. Haptics over Bluetooth: the report format worked out by SAxense (https://apps.sdore.me/SAxense).
@@ -137,24 +137,19 @@ Source code (MIT): see the mod page.
 
 CHANGES
 -------
-Unreleased    Controller Speaker: enforced real HID hardware speaker mute + audio-thread voice purge when
-              Mechanics=0; focused speaker output strictly on authentic in-game RDR2 .awc recordings (hip-holster
-              weapon draw/holster, lasso, bow creak, blade/skinning) and crisp mechanical clicks (cocking,
-              lever/bolt/pump, live per-round reloads, dry fire, reel clicks, wheel tick, Dead Eye marks).
-              Triggers & Combat: heavy progressive bow resistance (FEEDBACK up to 8/8 torque + staged creaks
-              and arm strain), break-aligned dry click, KickStrength=0 recoil off + auto-align safety clamp,
-              dual-trigger L2+R2 lasso struggle, smooth progressive R2 fishing cast + release pulse, melee on
-              CIRCLE + KO finishers (R1 kept free for Take Cover & Horse Brake), Double-Action variants break
-              at zone 8, WEAPON_OBJECT / Electric Lantern filtering, and completely relaxed/silent triggers &
-              haptics in main menus, pause menus, and loading screens.
-              World & LEDs: high-contrast tuning across all 9 ground surfaces + 5.5 cm slow-walk sensitivity,
-              state-driven horse/wagon mounting (excluding trains/boats), event-driven multi-stage herb
-              plucking, nearby moving train rumble, hail/gust/thunder weather, carrying load weight/grip,
-              on-change 3.5 s Health Player LEDs, explicit PlayerLeds=off clearing, and wanted police-light
-              LED sweep + tension heartbeat.
-              Fixes: async Win32 DllMain boot, native right-stick deadzone preserved with clean still-only L2
-              gyro bias/free-aim gating, clean overlapped HID cancellation, Loader-Lock-safe unload handling,
-              thread-safe speaker/gameaudio locking, immediate log flush, and dynamic 0x05 HID calibration.
+1.4.0  New, from TochaRude: punches, blocks and hits felt in the triggers, a heavier blow for a knockout;
+       the bow gets heavier as you draw it, creaks and strains; the lasso stiffens both triggers while you
+       hold someone; the fishing cast loads up on R2; a thump when you get on or off a horse or a wagon, and
+       when the horse lands a jump; passing trains you can feel; hail, storm gusts and thunder; carrying a
+       body makes every step heavier.
+       Player LEDs: Auto (rounds while armed, your health when it changes), Rounds, Health or Off - and a
+       police sweep while you're wanted, with a heartbeat that speeds up with the wanted level.
+       Sounds from the Controller: the game's own sounds for the lasso, the bow and blades; Off now mutes
+       the speaker completely.
+       Game Sounds and Player LEDs are on the settings page; Rain is now Weather.
+       Fixed: Dead Eye marks tick (they never did); no wagon ruts in boats; triggers stay slack in the pause
+       menu; the whistle no longer answers Arthur's own whistle; the shot point stops jumping between two
+       places.
 1.3.0  Haptics over Bluetooth: everything you feel over USB now works without the cable too (not the
        controller's speaker and microphone). Bluetooth=0 in the ini goes back to the plain rumble motors -
        then without the rain, bush and wading textures, which only blurred into one endless rumble there.

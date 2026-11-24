@@ -231,7 +231,7 @@ void DualSense::build_payload(const OutputState& o, uint8_t* p) {
     }
     std::memcpy(p + 10, o.r2.data(), 11);
     std::memcpy(p + 21, o.l2.data(), 11);
-    p[36] = uint8_t((o.trigger_power_reduction & 7) << 4);  // high nibble: trigger motor power reduction
+    p[36] = uint8_t(o.trigger_power_reduction & 7);         // low nibble: trigger motor power reduction (high: rumble)
     if (o.mute_led >= 0) {
         p[1] |= 0x01;
         p[8] = uint8_t(o.mute_led);

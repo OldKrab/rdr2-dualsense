@@ -25,5 +25,8 @@ cmake --build mod/build
 powershell -ExecutionPolicy Bypass -File tools/dev/make_release.ps1
 ```
 
+## Contributors
+- [TochaRude](https://github.com/TochaRude): the bow, lasso, fists, mounting, trains, weather, carrying and player LED modes of 1.4.0, the speaker's game sounds, and many fixes.
+
 ## License
 MIT — see `LICENSE`. Uses nlohmann/json (MIT) and stb_vorbis (public domain).

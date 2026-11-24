@@ -707,7 +707,7 @@ void AudioEngine::start_mic(float sens, std::function<void()> on_whistle) {
         std::lock_guard<std::mutex> ml(mu_);
         on_whistle_ = std::move(on_whistle);
     }
-    cooldown_s_ = std::max(0.3f, config().num("Mic", "Cooldown", 1.2f));
+    cooldown_s_ = std::max(0.3f, config().num("Mic", "Cooldown", 3.0f));
     mic_sens_ = sens;
     if (mic_.joinable() && !mic_running_.load()) mic_.join();
     if (mic_.joinable()) return;
@@ -753,6 +753,7 @@ void AudioEngine::mic_thread(float sens) {
                 frame.reserve(N);
                 std::vector<std::complex<float>> spec(N);
                 int run = 0, misses = 0;
+                bool held_off = false;             // the current tone began during the cooldown
                 float low_bg = 0;                  // background energy 80-400 Hz (game sound, room)
                 float last_hz = 0;
                 double cooldown_until = 0;
@@ -824,7 +825,10 @@ void AudioEngine::mic_thread(float sens) {
                             float hz = best * sr / N;
                             float level = best_v / (N / 4);
                             float s_eff = std::max(0.3f, mic_sens_.load());
-                            bool tonal = best_v > median * (12.0f / s_eff) && level > 0.0025f / s_eff && purity > 0.55f / std::sqrt(s_eff) && !voiced;
+                            // a peak on the edge of the whistle range is the slope of a tone outside it (half the
+                            // false whistles sat at 844 Hz, the lower edge)
+                            bool edge = best <= lo || best >= hi;
+                            bool tonal = best_v > median * (12.0f / s_eff) && level > 0.0025f / s_eff && purity > 0.55f / std::sqrt(s_eff) && !voiced && !edge;
                             bool steady = last_hz <= 0 || std::fabs(hz - last_hz) / last_hz < 0.3f;
                             if (tonal && steady) {
                                 ++run;
@@ -837,12 +841,18 @@ void AudioEngine::mic_thread(float sens) {
                                 run = 0;
                                 misses = 0;
                                 last_hz = 0;
+                                held_off = false;      // that tone is over
                             }
                             double t = now_s();
-                            float cd = cooldown_s_.load();
-                            if (run == int(0.15f * sr / (N / 2)) && t <= cooldown_until)
+                            // at least 3 s: Arthur answers with his own whistle from the speakers, and that
+                            // chained new detections every cooldown
+                            float cd = std::max(3.0f, cooldown_s_.load());
+                            if (run >= int(0.15f * sr / (N / 2)) && t <= cooldown_until && !held_off) {
+                                // a tone heard during the cooldown never counts - also not when it lasts past it
                                 LOGD("whistle heard again during the %.1f s cooldown (%.0f Hz)", cd, hz);
-                            if (run >= int(0.15f * sr / (N / 2)) && t > cooldown_until) {
+                                held_off = true;
+                            }
+                            if (run >= int(0.15f * sr / (N / 2)) && t > cooldown_until && !held_off) {
                                 cooldown_until = t + cd;
                                 run = 0;
                                 LOGI("whistle detected (%.0f Hz)", hz);

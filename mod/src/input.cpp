@@ -64,10 +64,11 @@ static bool hook(void* target, void* detour) {
     std::memcpy(patch + 1, &rel, 4);
     int64_t next = 0;
     std::memcpy(&next, patch, 8);
-    InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(target), next, orig);
+    bool patched = InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(target), next, orig) == orig;
     VirtualProtect(target, 8, old, &old);
     FlushInstructionCache(GetCurrentProcess(), target, 8);
-    return true;
+    if (!patched) VirtualFree(relay, 0, MEM_RELEASE);   // someone else patched it meanwhile
+    return patched;
 }
 
 bool Input::install_hook() {
@@ -299,25 +300,38 @@ void Input::track_gyro(const InputState& s, bool aiming, bool can_gyro) {
     gyro_t_ = s.t;
     if (dt <= 0 || dt > 0.05) return;
     float r[3];
-    for (int i = 0; i < 3; ++i) r[i] = float(s.gyro[i]) / 16.4f;   // deg/s
-    if (still_time_ < 0 && std::fabs(r[0]) + std::fabs(r[1]) + std::fabs(r[2]) < 15.0f) {
-        for (int i = 0; i < 3; ++i) bias_[i] = r[i];
-        still_time_ = 0;
+    float total = 0, change = 0;
+    for (int i = 0; i < 3; ++i) {
+        r[i] = float(s.gyro[i]) / 16.4f;   // deg/s
+        total += std::fabs(r[i]);
+        change += std::fabs(r[i] - prev_r_[i]);
+        prev_r_[i] = r[i];
     }
-    if (!active) {
+    // the first drift guess only from a controller held still (small, steady readings for a few samples), not
+    // one being turned: a wrong guess would look like motion and never be learned away
+    if (still_time_ < 0) {
+        seed_n_ = total < 15.0f && change < 1.5f ? seed_n_ + 1 : 0;
+        if (seed_n_ >= 8) {
+            for (int i = 0; i < 3; ++i) bias_[i] = r[i];
+            still_time_ = 0;
+        }
+    }
+    // resting: dt-scaled drift learning in every mode (Mode=always is active through all of play). While active
+    // only near-zero rates and slowly, so a slow deliberate aim isn't learned away.
+    if (still_time_ >= 0) {
         float mag = 0;
         for (int i = 0; i < 3; ++i) mag += std::fabs(r[i] - bias_[i]);
-        if (mag < 10.0f && still_time_ >= 0) {       // resting: dt-scaled drift learning (never while aiming)
+        if (mag < (active ? 3.0f : 10.0f)) {
             still_time_ += float(dt);
             if (still_time_ > 0.25f) {
-                float alpha = 1.0f - std::exp(-float(dt) / 0.15f);
+                float alpha = 1.0f - std::exp(-float(dt) / (active ? 2.0f : 0.15f));
                 for (int i = 0; i < 3; ++i) bias_[i] += (r[i] - bias_[i]) * alpha;
             }
         } else {
             still_time_ = 0;
         }
-        return;
     }
+    if (!active) return;
     if (aim_since_ < 0) aim_since_ = s.t;
     if (s.t - aim_since_ < 0.35) return;
     aim_fade_ = std::min(1.0f, aim_fade_ + float(dt) / 0.2f);

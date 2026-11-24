@@ -42,6 +42,9 @@ if (-not $KeepSettings) {
 $lml = Join-Path $GameDir "lml"
 $page = Join-Path $lml "DualSenseRDR2"
 if (Test-Path $page) { Remove-Item $page -Recurse; Write-Host "Removed the Settings page" }
+# the Settings page archive of every released version (their installs have no .dualsense-hash marker)
+$knownPages = @("A713B23C1B71F6B8367688A420AEBCA373150EF7B4B07A6171774D47342BFEC3",   # 1.0.0
+                "565CBC61F881F034F17C44B40ABC762881A71788862B3D1FAF0289FE9F3B5DFE")   # 1.1.0 - 1.3.0
 foreach ($a in @("replace\update_4\x64\data\ui\startup_data.rpf")) {
     $p = Join-Path $lml $a
     $expectedHash = ""
@@ -50,8 +53,9 @@ foreach ($a in @("replace\update_4\x64\data\ui\startup_data.rpf")) {
         if ($raw) { $expectedHash = $raw.Trim() }
         Remove-Item "$p.dualsense-hash"
     }
+    $curHash = if (Test-Path $p) { (Get-FileHash $p -Algorithm SHA256).Hash } else { "" }
     if (Test-Path "$p.dualsense-backup") { Move-Item "$p.dualsense-backup" $p -Force; Write-Host "Restored $a" }
-    elseif ((Test-Path $p) -and $expectedHash -and ((Get-FileHash $p -Algorithm SHA256).Hash -eq $expectedHash)) {
+    elseif ($curHash -and (($curHash -in $knownPages) -or $curHash -eq $expectedHash)) {
         Remove-Item $p
         Write-Host "Removed $a"
     }

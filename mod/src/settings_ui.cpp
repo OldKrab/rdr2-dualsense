@@ -67,14 +67,25 @@ void create_store() {
 
 }  // namespace
 
-void settings_ui_tick(double /*now*/) {
+void settings_ui_tick(double now) {
     if (!page.root || !DATABINDING_IS_ENTRY_VALID(page.root)) {
+        create_store();
+        return;
+    }
+    // a row the game dropped (while the root stayed) would be skipped for good - the page then shows nothing
+    // of the ini. Build the whole store again (at most once a second, in case the game keeps dropping it).
+    static double rebuilt_t = -10;
+    for (const PageRow& r : page.rows) {
+        if (r.store && DATABINDING_IS_ENTRY_VALID(r.store)) continue;
+        if (now - rebuilt_t < 1.0) return;
+        LOGI("settings page: row %s lost its data - building the page again", r.entry->id);
+        rebuilt_t = now;
+        DATABINDING_REMOVE_DATA_ENTRY(page.root);
         create_store();
         return;
     }
     std::vector<std::tuple<std::string, std::string, std::string>> updates;
     for (PageRow& r : page.rows) {
-        if (!r.store || !DATABINDING_IS_ENTRY_VALID(r.store)) continue;
         const MenuEntry& e = *r.entry;
         int v = DATABINDING_READ_INT_FROM_PARENT(r.store, "value");
         if (v != r.shown) {                                   // the page changed it while the menu was open

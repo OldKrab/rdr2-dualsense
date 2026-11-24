@@ -456,9 +456,9 @@ fx::Block WeaponEngine::update_gun(int raw, double now, EngineFrame& f, const Ga
             }
         }
         bool can_rearm = free_fire || (game_rate ? g.ready : now - shot_t_ >= rate_s_ * slow());
-        // Require the trigger to actually be below reset (or freshly crossing from below) so a release-and-repull
-        // during kick cannot fire an unintended shot on the first frame back in 'ready'.
-        bool released = free_fire ? (game_rt_ == 0 && raw <= reset) : (raw <= reset);
+        // free fire: released at any moment since the shot counts - also during the kick above (a re-pull
+        // during the kick is a real shot: fanning, quick double action)
+        bool released = free_fire ? game_rt_ == 0 : raw <= reset;
         if (can_rearm && released && now - shot_t_ > 0.05) {
             not_ready_since_ = -1;
             if (last_dry_ && clip_size_ && !g.valid) {
@@ -1007,12 +1007,18 @@ void WeaponEngine::analyse(double now) {
             continue;
         }
         snaps_.push_back(snap_from);
-        if (snaps_.size() > 5) snaps_.erase(snaps_.begin());
-        if (set_.auto_align && snaps_.size() >= 3 && kind_ == "gun") {
+        LOGD("%s: the trigger snapped at raw %d (shot point %d)", id_.c_str(), snap_from, break_raw_);
+        if (snaps_.size() > 7) snaps_.erase(snaps_.begin());
+        if (set_.auto_align && snaps_.size() >= 5 && kind_ == "gun") {
             std::vector<int> s = snaps_;
             std::sort(s.begin(), s.end());
-            int target = clampv(s[s.size() / 2] + 2, 30, 254);
-            if (std::abs(target - break_raw_) >= 3) {
+            // move only on snaps that agree (the middle ones close together) and clearly elsewhere; then start
+            // over, so snaps felt with the old point don't mix into the next decision - with 3 snaps and a 3-step
+            // threshold it see-sawed between two points (~170 <-> ~218)
+            const int lo = s[s.size() / 4], hi = s[s.size() - 1 - s.size() / 4];
+            const int target = clampv(s[s.size() / 2] + 2, 30, 254);
+            if (hi - lo <= 20 && std::abs(target - break_raw_) >= 8) {
+                snaps_.clear();
                 LOGI("%s: shot point %d -> %d (the trigger snaps at ~%d)", id_.c_str(), break_raw_, target, target - 2);
                 break_raw_ = target;
                 reset_raw_ = std::max(0, std::min(reset_raw_, target - 25));

@@ -83,6 +83,9 @@ if (-not (Test-Path $lml)) {
     Copy-Item (Join-Path $lmlSrc "install.xml") $dst -Force
     Copy-Item (Join-Path $lmlSrc "data\ui\settings\controls.ymt") (Join-Path $dst "data\ui\settings") -Force
     Copy-Item (Join-Path $lmlSrc "data\gamepad_icons_pc.ytd"), (Join-Path $lmlSrc "data\pm_settings_controls.ytd") (Join-Path $dst "data") -Force
+    # the Settings page archive of every released version (their installs have no .dualsense-hash marker)
+    $knownPages = @("A713B23C1B71F6B8367688A420AEBCA373150EF7B4B07A6171774D47342BFEC3",   # 1.0.0
+                    "565CBC61F881F034F17C44B40ABC762881A71788862B3D1FAF0289FE9F3B5DFE")   # 1.1.0 - 1.3.0
     foreach ($a in $archives) {
         $to = Join-Path $lml $a
         $srcArch = Join-Path $lmlSrc $a
@@ -90,7 +93,8 @@ if (-not (Test-Path $lml)) {
         $hashMarker = "$to.dualsense-hash"
         if ((Test-Path $to) -and -not (Test-Path "$to.dualsense-backup")) {
             $curHash = (Get-FileHash $to).Hash
-            $ours = (Test-Path $hashMarker) -and ((Get-Content $hashMarker -Raw).Trim() -eq $curHash)
+            $marker = if (Test-Path $hashMarker) { Get-Content $hashMarker -Raw } else { $null }
+            $ours = ($curHash -in $knownPages) -or ($marker -and $marker.Trim() -eq $curHash)
             if (-not $ours -and ($curHash -ne $srcHash)) {
                 # another mod's archive: keep it so uninstall.ps1 can put it back
                 Copy-Item $to "$to.dualsense-backup"

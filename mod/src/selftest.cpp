@@ -276,13 +276,16 @@ int run_selftests(const fs::path& data) {
     {   // new defaults reach players who already have an ini: untouched old defaults move, changed ones stay, once
         const std::string pid = std::to_string(GetCurrentProcessId());
         fs::path tmp = fs::temp_directory_path() / ("dsr2_migrate_test_" + pid + ".ini");
-        { std::ofstream o(tmp); o << "[General]\nDebug=0\n[Haptics]\nWeather=0.5\nGameRumble=0.35\n[Speaker]\nMechanics=1\n"; }
+        { std::ofstream o(tmp); o << "[General]\nDebug=0\n[Haptics]\nWeather=0.5\nGameRumble=0.35\n[Speaker]\nMechanics=1\n"
+                                     "[Lightbar]\nAmmoLeds=0\n[Mic]\nCooldown=1.2\n"; }
         Config cfg;
         cfg.load(tmp.wstring());
         CHECK(cfg.str("Speaker", "Mechanics", "") == "0" && std::fabs(cfg.num("Haptics", "GameRumble", 9) - 0.15f) < 1e-4f,
               "untouched old defaults -> the new ones");
         CHECK(std::fabs(cfg.num("Haptics", "Weather", 9) - 0.5f) < 1e-4f, "a value the player changed stays");
-        CHECK(cfg.integer("General", "DefaultsVersion", 0) == 2, "the file remembers it is up to date");
+        CHECK(cfg.str("Lightbar", "PlayerLeds", "") == "off" && std::fabs(cfg.num("Mic", "Cooldown", 9) - 3.0f) < 1e-4f,
+              "AmmoLeds=0 -> PlayerLeds=off; whistle cooldown 1.2 -> 3");
+        CHECK(cfg.integer("General", "DefaultsVersion", 0) == 3, "the file remembers it is up to date");
         cfg.set("Speaker", "Mechanics", "1");             // the player turns it back on later
         Config again;
         again.load(tmp.wstring());
@@ -593,7 +596,7 @@ int run_selftests(const fs::path& data) {
         os.speaker_enabled = false;
         uint8_t pl[47] = {};
         ds.encode_payload(os, pl);
-        CHECK(pl[36] == (5 << 4), "trigger_power_reduction written to high nibble of byte 36");
+        CHECK(pl[36] == 5, "trigger_power_reduction written to the low nibble of byte 36");
         CHECK((pl[0] & 0x20) && pl[5] == 0x00 && pl[7] == 0x00,
               "speaker_enabled=false mutes hardware speaker volume (0x00) and disables internal speaker path");
         os.speaker_enabled = true;

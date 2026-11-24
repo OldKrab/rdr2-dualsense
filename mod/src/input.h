@@ -63,7 +63,8 @@ private:
     double touch_t_ = 0;
     bool two_ = false;
     // gyro
-    float bias_[3] = {0, 0, 0};
+    float bias_[3] = {0, 0, 0}, prev_r_[3] = {0, 0, 0};
+    int seed_n_ = 0;
     float still_time_ = -1.0f, smooth_yaw_ = 0, smooth_pitch_ = 0;
     float aim_fade_ = 0;
     double gyro_log_t_ = 0, aim_since_ = -1;

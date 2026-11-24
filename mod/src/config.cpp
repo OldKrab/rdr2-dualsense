@@ -47,7 +47,7 @@ HideOtherPads=1
 ReloadKey=120
 ; Which defaults this file has. A newer version of the mod moves settings still at an older default to the new
 ; one (settings you changed stay). Leave it alone.
-DefaultsVersion=2
+DefaultsVersion=3
 ; Ground is identified from the game's material automatically. This key shows what is under you;
 ; pressing it again while shown changes it (ground, grass, mud, stone, gravel, wood, snow, sand, water).
 ; Saved in DualSenseRDR2\materials.json. 121 = F10
@@ -146,8 +146,6 @@ Enabled=1
 Brightness=1.0
 ; Player LEDs below the touchpad: auto (ammo when armed, health changes when unarmed), health, ammo, or off
 PlayerLeds=auto
-; Legacy toggle (0 turns player LEDs off)
-AmmoLeds=1
 ; Ambient colour follows the time of day when nothing else is shown
 TimeOfDay=1
 
@@ -178,8 +176,8 @@ WhistleForHorse=0
 Sensitivity=1.0
 ; Two firm thumps + a blue lightbar flash when a whistle or your phrase is recognised (0 = off)
 Confirm=1.0
-; Seconds after a recognised whistle before the next one counts
-Cooldown=1.2
+; Seconds after a recognised whistle before the next one counts (at least 3: Arthur whistles back)
+Cooldown=3
 
 [Voice]
 ; Say the phrase into the controller: the camera turns to the closest person (within Range metres) and
@@ -267,7 +265,7 @@ bool Config::load(const std::wstring& path) {
 namespace {
 // Defaults that changed: a player's ini written by an older version still holds the old value. Moved to the new one
 // when it is still exactly the old default (the player never changed it); anything else is the player's choice.
-constexpr int kDefaultsVersion = 2;
+constexpr int kDefaultsVersion = 3;
 struct DefaultChange {
     int version;
     const char *section, *key, *old_value, *new_value;
@@ -276,6 +274,7 @@ constexpr DefaultChange kChanges[] = {
     {2, "Speaker", "Mechanics", "1", "0"},           // sounds from the controller: off (out of sync, players asked)
     {2, "Haptics", "Weather", "0", "0.3"},           // rain drops on the hat: on, subtle
     {2, "Haptics", "GameRumble", "0.35", "0.15"},    // the game's own rumble: quieter (pulses on herbs and prompts)
+    {3, "Mic", "Cooldown", "1.2", "3"},              // Arthur's own whistle from the speakers counted as a new one
 };
 
 bool same_value(const std::string& a, const std::string& b) {
@@ -299,6 +298,11 @@ void Config::migrate() {
         set(c.section, c.key, c.new_value);
         LOGI("settings: %s.%s %s -> %s (the new default; you had not changed it)", c.section, c.key, c.old_value,
              c.new_value);
+    }
+    // 3: the player LEDs got modes (PlayerLeds); before, AmmoLeds=0 switched them off
+    if (have < 3 && str("Lightbar", "PlayerLeds", "").empty() && !flag("Lightbar", "AmmoLeds", true)) {
+        set("Lightbar", "PlayerLeds", "off");
+        LOGI("settings: Lightbar.PlayerLeds = off (you had AmmoLeds=0)");
     }
     set("General", "DefaultsVersion", std::to_string(kDefaultsVersion));
     migrating_ = false;

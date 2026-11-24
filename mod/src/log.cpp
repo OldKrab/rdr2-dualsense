@@ -11,8 +11,6 @@ namespace dsr2::log {
 static std::mutex g_mu;
 static FILE* g_file = nullptr;
 static std::atomic<bool> g_debug{false};
-static int g_unflushed = 0;
-static ULONGLONG g_last_flush = 0;
 
 void open(const std::wstring& path) {
     std::lock_guard<std::mutex> l(g_mu);
@@ -27,8 +25,6 @@ void close() {
         fclose(g_file);
     }
     g_file = nullptr;
-    g_unflushed = 0;
-    g_last_flush = 0;
 }
 
 void set_debug(bool on) { g_debug.store(on, std::memory_order_relaxed); }
@@ -43,15 +39,9 @@ void write(const char* level, const char* fmt, ...) {
     SYSTEMTIME st;
     GetLocalTime(&st);
     std::lock_guard<std::mutex> l(g_mu);
-    ULONGLONG now_ms = GetTickCount64();
     FILE* out = g_file ? g_file : stderr;
     fprintf(out, "%02d:%02d:%02d.%03d [%s] %s\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, level, msg);
-    bool urgent = !g_file || !level || level[0] != 'D';
-    if (urgent || ++g_unflushed >= 16 || now_ms - g_last_flush >= 250) {
-        fflush(out);
-        g_unflushed = 0;
-        g_last_flush = now_ms;
-    }
+    fflush(out);                                  // every line: the last ones before a crash are the ones that matter
 }
 
 }  // namespace dsr2::log

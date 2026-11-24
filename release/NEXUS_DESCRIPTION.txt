@@ -1,7 +1,7 @@
 === Nexus Mods page text (paste into the description; Nexus uses BBCode) ===
 
 NAME:     DualSense for RDR2 - Adaptive Triggers and Haptics
-VERSION:  1.3.0
+VERSION:  1.4.0
 CATEGORY: Gameplay  (or: Utilities)
 IMAGES:   release/banner.png (main image)
 SUMMARY (short):
@@ -23,7 +23,10 @@ is in the game's own menu: Pause > Settings > Controls > Controller > DualSense.
 [*]The kick comes with the game's real shot; a clean gun works like clockwork, a dirty one drags like mud;
 exhaustion and cold make the pull shaky
 [*]Dead Eye: every painted target ticks, every shot of the volley kicks as it fires
-[*]Fishing: R2 tugs when a fish bites; L2 carries the real line tension and strains before it snaps
+[*]Fishing: R2 loads up the cast and tugs when a fish bites; L2 carries the real line tension and strains before it snaps
+[*]Bow: R2 gets heavier the further you draw, the wood creaks, your arm strains if you hold too long
+[*]Lasso: both triggers stiffen while you hold someone on the rope
+[*]Fists: punches, blocks and hits in the triggers, a heavier blow for a knockout
 [*]Weapon wheel: a light tick for every weapon you move over; L2/R2 click like a selector switch - never like a shot
 [/list]
 
@@ -32,6 +35,7 @@ exhaustion and cold make the pull shaky
 [*]Hoofbeats from the real hooves at every gait, on the real ground material (mud, gravel, wood, grass, snow...)
 [*]Arthur's footsteps from his real feet, landings, ledge grabs, doors, drawing and holstering
 [*]Hits from their direction, nearby gunfire, heartbeat, shivers
+[*]Getting on and off a horse or a wagon, the horse landing a jump, passing trains, hail, storm gusts and thunder
 [*]Honor going up or down, bites / sips / puffs, gun cleaning, brushing the horse, skinning, herbs, bathing
 [*]Five finger fillet, poker, blackjack, dominoes
 [*]Gun shots built from each gun's own recordings - the game's sounds, or your sound mod's if you use one
@@ -45,7 +49,8 @@ Bluetooth headphones).
 
 [size=4][b]Lightbar, LEDs, speaker[/b][/size]
 Muzzle flash, hits, Dead Eye glow, lantern flicker, wanted, low health, honor; player LEDs show the rounds
-left; the game's own holster and lasso sounds from the controller speaker (off by default).
+left or your health, and sweep like a police light while you're wanted; the game's own holster, lasso, bow and
+blade sounds from the controller speaker (off by default).
 
 [size=4][b]Settings in the game's own menu[/b][/size]
 Pause > Settings > Controls > Controller > [b]DualSense[/b] - a real page of the game's Settings with every
@@ -83,7 +88,13 @@ loader and LML (as for any mod), and back for story mode. The mod changes none o
 [size=4][b]Open source[/b][/size]
 MIT licensed - source: https://github.com/OldKrab/rdr2-dualsense
 Haptics over Bluetooth thanks to SAxense: https://apps.sdore.me/SAxense
+Bow, lasso, fists, horse and wagon mounting, trains, weather and the player LED modes in 1.4.0 by TochaRude.
 
---- CHANGELOG 1.3.0 (the file upload's changelog field, one line each) ---
-Haptics over Bluetooth: everything you feel over USB now works without the cable too (not the controller's speaker and microphone)
-No more phantom hits after a fight: health slowly draining (a tonic wearing off) was felt as a bullet hit every few seconds
+--- CHANGELOG 1.4.0 (the file upload's changelog field, one line each) ---
+New, from TochaRude: punches, blocks and hits in the triggers, a heavier blow for a knockout
+The bow gets heavier as you draw it, creaks and strains; the lasso stiffens both triggers while you hold someone; the fishing cast loads up on R2
+A thump when you get on or off a horse or a wagon and when the horse lands a jump; passing trains; hail, storm gusts and thunder; carrying a body makes every step heavier
+Player LEDs: Auto (rounds while armed, your health when it changes), Rounds, Health or Off - and a police sweep while you're wanted
+Sounds from the Controller: the game's own sounds for the lasso, the bow and blades; Off now mutes the speaker completely
+Game Sounds and Player LEDs are on the settings page; Rain is now Weather
+Fixed: Dead Eye marks tick; no wagon ruts in boats; triggers stay slack in the pause menu; the whistle no longer answers Arthur's own whistle; the shot point stops jumping between two places

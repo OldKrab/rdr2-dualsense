@@ -213,6 +213,8 @@ bool Core::on_input(const InputState& s, OutputState& out) {
     if (reload_requested_.exchange(false)) {
         load_data();
         apply_mic();
+        // the game-audio layer starts once it is above 0 - also when switched on in the settings page
+        audio_.start_game_audio(config().num("Haptics", "GameAudio", 0.0f), config().str("Haptics", "GameAudioDevice", ""));
         LOGI("settings and data reloaded");
         audio_.ack_flash_until = now_s() + 0.4;   // the confirmation flash: after the reload (it takes ~0.6 s)
     }
