@@ -29,7 +29,7 @@ INSTALL
 Copy everything from this zip into the game folder - the folder with RDR2.exe in it, not a subfolder
 (a file one folder too deep is simply never loaded):
     DualSenseRDR2.asi
-    DualSenseRDR2\  (folder with weapons.json, haptics.json, sound_labels.json, speech_voices.txt)
+    DualSenseRDR2\  (folder with DualSenseCore.dll, weapons.json, haptics.json, sound_labels.json, speech_voices.txt)
     lml\            (merges into LML's folder: lml\DualSenseRDR2 and one archive in lml\replace)
 Start the game. Settings are created on first start in DualSenseRDR2.ini.
 If you use LML's Mod Manager, make sure "DualSense for RDR2 - Settings page" is enabled.
@@ -137,6 +137,17 @@ Source code (MIT): see the mod page.
 
 CHANGES
 -------
+Unreleased  Stability, save-load reload, and gyro fixes:
+            - Exit crash fix (0xc0000409 / 0x40000015): process-lifetime singletons remain immortal across
+              ExitProcess so CRT atexit destructors never run against active background threads, and
+              shv_scriptUnregister is skipped on process exit.
+            - ScriptHookRDR2 V2 save-load hot-reload fix: split thin CRT-free DualSenseRDR2.asi loader shim
+              from pinned DualSenseRDR2\DualSenseCore.dll so FreeLibrary/LoadLibrary reloads drop the .asi
+              refcount to 0 cleanly, re-register script_main (#2+), and keep haptics, XInput hooks, and
+              DualSenseSettings intact (plus stalled-script native rumble fallback and reload unit test).
+            - Gyro upward-drift and recoil fix: strict variance-bounded stillness bias calibration (1.2 deg/s
+              band clamped to [-5, +5] deg/s) with 0.8 deg/s soft deadzone, plus independent yaw/pitch camera
+              writes and a 0.40 s post-shot pitch recoil mute in Output=camera mode.
 1.4.0  New, from TochaRude: punches, blocks and hits felt in the triggers, a heavier blow for a knockout;
        the bow gets heavier as you draw it, creaks and strains; the lasso stiffens both triggers while you
        hold someone; the fishing cast loads up on R2; a thump when you get on or off a horse or a wagon, and

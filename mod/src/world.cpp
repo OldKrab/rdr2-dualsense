@@ -12,8 +12,8 @@
 namespace dsr2 {
 
 World& world() {
-    static World w;
-    return w;
+    static World* w = new World();
+    return *w;
 }
 
 static float atomic_take(std::atomic<float>& a) { return a.exchange(0.0f); }
@@ -25,6 +25,12 @@ static void atomic_add(std::atomic<float>& a, float v) {
 void World::add_gyro(float yaw, float pitch) {
     atomic_add(gyro_yaw_, yaw);
     atomic_add(gyro_pitch_, pitch);
+}
+
+void World::notify_shot(double now) {
+    double until = now + 0.40;
+    double cur = gyro_pitch_mute_until_.load(std::memory_order_relaxed);
+    while (cur < until && !gyro_pitch_mute_until_.compare_exchange_weak(cur, until, std::memory_order_relaxed)) {}
 }
 
 GameSnapshot World::snapshot() {
@@ -708,11 +714,88 @@ void World::greet(int pl, int me, float px, float py, const int* peds, int n, co
     }
 }
 
+void World::reset_session_state() {
+    last_health_ = -1;
+    last_me_ = 0;
+    mount_seen_ = was_on_mount_ = was_in_wagon_ = false;
+    air_time_ = horse_air_time_ = 0;
+    last_item_ = 0;
+    care_until_ = skin_until_ = rein_until_ = 0;
+    spurs_left_ = spur_frames_ = soothe_frames_ = 0;
+    ped_health_.clear();
+    hit_by_me_t_.clear();
+    ped_shot_t_.clear();
+    feet_ped_ = hooves_horse_ = 0;
+    hoof_count_ = 0;
+    hoof_times_.clear();
+    swim_ped_ = paddle_horse_ = 0;
+    swim_was_ = horse_swim_was_ = false;
+    damaged_me_by_ = 0;
+    damaged_me_t_ = -10;
+    reply_target_ = 0;
+    reply_at_ = 0;
+    greet_ = Greet::Idle;
+    greet_target_ = 0;
+    bush_handle_ = 0;
+    bush_hit_.clear();
+    talk_.clear();
+    reqs_.clear();
+    scenes_.clear();
+    honor_ok_ = false;
+    honor_logged_ = false;
+    minigame_ = 0;
+    mg_state_.clear();
+    tile_at_ = 0;
+    was_climbing_ = was_door_ = false;
+    explosion_on_ = false;
+    gyro_pitch_mute_until_.store(0.0, std::memory_order_relaxed);
+}
+
+void World::on_script_reload() {
+    reset_session_state();
+    was_loading_ = false;
+    settings_ui_mark_dirty();
+    std::lock_guard<std::mutex> l(mu_);
+    snap_ = GameSnapshot{};
+    snap_.time = now_s();
+}
+
 void World::tick() {
     using namespace nat;
     Config& cfg = config();
     GameSnapshot s;
     s.time = now_s();
+    const bool loading = IS_LOADING_SCREEN_VISIBLE() || GET_IS_LOADING_SCREEN_ACTIVE() || IS_PLAYER_SWITCH_IN_PROGRESS();
+    Player pl = PLAYER_ID();
+    Ped me = loading ? 0 : PLAYER_PED_ID();
+    if (loading || !me || !IS_PLAYER_PLAYING(pl)) {
+        if (!was_loading_) {
+            LOGD("world: %s - pausing gameplay natives", loading ? "loading / player switch" : "no active player");
+            was_loading_ = true;
+        }
+        reset_session_state();
+        settings_ui_mark_dirty();
+        dialogue().game_tick({}, 0, true, false);
+        last_tick_ = s.time;
+        std::lock_guard<std::mutex> l(mu_);
+        snap_ = s;
+        return;
+    }
+    if (was_loading_) {
+        LOGI("world: active again (ped %d)", me);
+        was_loading_ = false;
+        settings_ui_mark_dirty();
+    } else if (last_me_ && me != last_me_) {
+        LOGI("world: player entity changed (%d -> %d) - resetting session state", last_me_, me);
+        reset_session_state();
+        settings_ui_mark_dirty();
+    } else if (last_tick_ > 0 && s.time - last_tick_ > 0.5) {
+        LOGD("world: script tick resumed after %.1f s", s.time - last_tick_);
+        settings_ui_mark_dirty();
+    }
+    last_me_ = me;
+    if (!game_files::ready()) core().load_game_files();   // scripts run: the game's archives are mounted
+    settings_ui_tick(s.time);
     limb_probe_ = log::debug_enabled() && cfg.flag("General", "Record", false);   // recorder, bush probe, cue log
     // Testing (Debug=1): [General] SetWeather=rain / thunderstorm / snow / sunny ... sets the game's weather when it
     // changes (edit the ini, hold PS); "clear" gives the weather back to the game.
@@ -758,27 +841,8 @@ void World::tick() {
             next_bolt_ = s.time + 8.0 + double(std::rand() % 13);
         }
     }
-    if (!game_files::ready()) core().load_game_files();   // scripts run: the game's archives are mounted
-    settings_ui_tick(s.time);            // the Settings page's data store, also while no player exists
-    Player pl = PLAYER_ID();
-    Ped me = PLAYER_PED_ID();
-    if (!me || !IS_PLAYER_PLAYING(pl)) {
-        last_health_ = -1;
-        mount_seen_ = was_on_mount_ = was_in_wagon_ = false;
-        air_time_ = horse_air_time_ = 0;
-        last_item_ = 0;
-        care_until_ = skin_until_ = rein_until_ = 0;
-        spurs_left_ = 0;
-        ped_health_.clear();
-        hit_by_me_t_.clear();
-        ped_shot_t_.clear();
-        std::lock_guard<std::mutex> l(mu_);
-        snap_ = s;
-        return;
-    }
     s.valid = true;
-    s.halted = IS_PAUSE_MENU_ACTIVE() || IS_LOADING_SCREEN_VISIBLE() || GET_IS_LOADING_SCREEN_ACTIVE() ||
-               IS_PLAYER_SWITCH_IN_PROGRESS() || IS_SCREEN_FADED_OUT() || !IS_SCREEN_FADED_IN();
+    s.halted = IS_PAUSE_MENU_ACTIVE() || IS_SCREEN_FADED_OUT() || !IS_SCREEN_FADED_IN();
     s.blocked = s.halted || !IS_PLAYER_CONTROL_ON(pl);
     s.cutscene = s.blocked && !s.halted;
     if (log::debug_enabled()) {                       // debug: when control goes and comes back (cutscenes), and why
@@ -880,6 +944,7 @@ void World::tick() {
     s.wheel = IS_CONTROL_PRESSED(0, kWheel) || IS_DISABLED_CONTROL_PRESSED(0, kWheel);
     s.wheel_item = s.wheel ? HUD_GET_INVENTORY_WHEEL_CURRENTLY_HIGHLIGHTED() : 0;
     s.shooting = IS_PED_SHOOTING(me);
+    if (s.shooting) notify_shot(s.time);
     s.free_aim = IS_PLAYER_FREE_AIMING(pl);
     s.lock_on = IS_PLAYER_TARGETTING_ANYTHING(pl);
     s.aiming = s.free_aim || s.lock_on;
@@ -1600,11 +1665,13 @@ void World::tick() {
 
     // --- gyro aim: turn the camera by what the controller turned ---
     float yaw = atomic_take(gyro_yaw_), pitch = atomic_take(gyro_pitch_);
-    // only while the right stick rests: setting the camera every frame would override the stick
-    if (gyro_enabled && !s.blocked && ((s.armed && s.free_aim && !s.lock_on) || gyro_wants_always) && !gyro_stick_busy &&
-        (std::fabs(yaw) > 1e-4f || std::fabs(pitch) > 1e-4f)) {
-        SET_GAMEPLAY_CAM_RELATIVE_HEADING(GET_GAMEPLAY_CAM_RELATIVE_HEADING() + yaw);
-        SET_GAMEPLAY_CAM_RELATIVE_PITCH(GET_GAMEPLAY_CAM_RELATIVE_PITCH() + pitch);
+    // only while the right stick rests: setting the camera every frame would override the stick.
+    // Apply yaw and pitch independently and mute pitch writes briefly after shots so game recoil is not baked in.
+    if (gyro_enabled && !s.blocked && ((s.armed && s.free_aim && !s.lock_on) || gyro_wants_always) && !gyro_stick_busy) {
+        if (std::fabs(yaw) > 1e-3f)
+            SET_GAMEPLAY_CAM_RELATIVE_HEADING(GET_GAMEPLAY_CAM_RELATIVE_HEADING() + yaw);
+        if (allow_gyro_pitch(s.time, gyro_pitch_mute_until_.load(std::memory_order_relaxed), pitch))
+            SET_GAMEPLAY_CAM_RELATIVE_PITCH(GET_GAMEPLAY_CAM_RELATIVE_PITCH() + pitch);
     }
 
     std::lock_guard<std::mutex> l(mu_);

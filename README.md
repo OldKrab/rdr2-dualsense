@@ -22,6 +22,7 @@ Players: download it from **[Nexus Mods](https://www.nexusmods.com/reddeadredemp
 cmake -S mod -B mod/build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build mod/build
 .\mod\build\dsr2_test.exe --selftest
+.\mod\build\test_reload\dsr2_reload_test.exe
 powershell -ExecutionPolicy Bypass -File tools/dev/make_release.ps1
 ```
 

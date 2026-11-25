@@ -83,6 +83,7 @@ class World {
 public:
     void tick();                                     // script thread, every frame
     void shutdown();                                 // stop background surface worker on unload
+    void on_script_reload();                         // reset transient state after ScriptHook V2 reload
     // hoof diagnostics (debug log)
     int hoof_plants_ = 0;
     int foot_plants_ = 0;                // debug: steps felt since foot_stat_t_
@@ -129,6 +130,10 @@ public:
     GameSnapshot snapshot();
     std::vector<WorldEvent> take_events();
     void add_gyro(float yaw_deg, float pitch_deg);
+    void notify_shot(double now);
+    static bool allow_gyro_pitch(double now, double mute_until, float pitch) {
+        return now >= mute_until && std::fabs(pitch) > 1e-3f;
+    }
     void request_greet() { greet_requested_ = true; }   // any thread (voice recognizer)
     enum HorseCommand { HorseNone, HorseCalm, HorseStop, HorseSpur };
     void request_horse(HorseCommand c) { horse_cmd_ = c; }   // any thread (voice recognizer)
@@ -137,6 +142,7 @@ public:
     std::atomic<bool> gyro_stick_busy{false};
 
 private:
+    void reset_session_state();
     struct Limb {                               // a hoof or a foot (World::steps)
         int bone = -1;
         double last_plant = 0, last_td = 0, last_seen = -10, reset_t = 0;   // felt / any touchdown / tracked / restarted
@@ -198,6 +204,7 @@ private:
     void speech_probe(int me, const int* peds, int n, float px, float py, float pz, float cam, double now);
     int melee_hits_ = 0, melee_ko_ = 0;
     std::atomic<float> gyro_yaw_{0}, gyro_pitch_{0};
+    std::atomic<double> gyro_pitch_mute_until_{0.0};
     // bodies
     Surfaces surfaces_;
     bool surfaces_loaded_ = false;
@@ -206,6 +213,8 @@ private:
     int hoof_count_ = 0;
     std::deque<double> hoof_times_;
     double last_tick_ = 0, air_time_ = 0, horse_air_time_ = 0;
+    int last_me_ = 0;
+    bool was_loading_ = false;
     bool was_climbing_ = false, was_door_ = false;
     float step_strength_ = 1;
     float last_step_t_ = 0;

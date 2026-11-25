@@ -4,18 +4,20 @@
 namespace dsr2 {
 
 World& world() {
-    static World w;
-    return w;
+    static World* w = new World();
+    return *w;
 }
 
 void World::tick() {}
 void World::shutdown() {}
+void World::on_script_reload() {}
 GameSnapshot World::snapshot() { return GameSnapshot{}; }
 std::vector<WorldEvent> World::take_events() { return {}; }
 void World::add_gyro(float yaw, float pitch) {
     gyro_yaw_ = gyro_yaw_.load() + yaw;
     gyro_pitch_ = gyro_pitch_.load() + pitch;
 }
+void World::notify_shot(double) {}
 float World::pan_to(float, float, float, float, float) const { return 0; }
 float World::frame_time() const { return 0; }
 

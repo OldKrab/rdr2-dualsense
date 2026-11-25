@@ -37,6 +37,9 @@ if (-not $KeepSettings) {
     if (Test-Path $ini) { Remove-Item $ini }
     $data = Join-Path $GameDir "DualSenseRDR2"
     if (Test-Path $data) { Remove-Item $data -Recurse }
+} else {
+    $coreDll = Join-Path $GameDir "DualSenseRDR2\DualSenseCore.dll"
+    if (Test-Path $coreDll) { Remove-Item $coreDll }
 }
 # the Settings page (LML): our folder and archive (another mod's copy is put back if we kept one)
 $lml = Join-Path $GameDir "lml"

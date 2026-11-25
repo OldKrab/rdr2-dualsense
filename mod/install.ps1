@@ -35,7 +35,8 @@ if (Get-Process -Name RDR2 -ErrorAction SilentlyContinue) { throw "Close Red Dea
 Write-Host "Game: $GameDir"
 
 $asi = Join-Path $here "build\DualSenseRDR2.asi"
-if (-not (Test-Path $asi)) { throw "Build the mod first (build\DualSenseRDR2.asi missing)" }
+$coreDll = Join-Path $here "build\DualSenseCore.dll"
+if (-not (Test-Path $asi) -or -not (Test-Path $coreDll)) { throw "Build the mod first (build\DualSenseRDR2.asi and build\DualSenseCore.dll missing)" }
 foreach ($req in "ScriptHookRDR2.dll", "dinput8.dll") {
     if (-not (Test-Path (Join-Path $GameDir $req))) { Write-Warning "$req is missing - install Script Hook RDR2 and its ASI loader (dev-c.com)" }
 }
@@ -60,6 +61,7 @@ if ($moved.Count) {
 Copy-Item $asi (Join-Path $GameDir "DualSenseRDR2.asi") -Force
 $data = Join-Path $GameDir "DualSenseRDR2"
 New-Item -ItemType Directory -Force $data | Out-Null
+Copy-Item $coreDll (Join-Path $data "DualSenseCore.dll") -Force
 foreach ($f in "weapons.json", "haptics.json", "calibration.json", "sound_labels.json", "speech_voices.txt") {
     $src = Join-Path $lab $f
     if (Test-Path $src) { Copy-Item $src (Join-Path $data $f) -Force; Write-Host "  data: $f" }
@@ -67,7 +69,7 @@ foreach ($f in "weapons.json", "haptics.json", "calibration.json", "sound_labels
 if (-not (Test-Path (Join-Path $data "calibration.json"))) {
     Write-Warning "No trigger calibration yet - run the Trigger Lab's Calibrate page and install again for exact shot timing."
 }
-Write-Host "Installed DualSenseRDR2.asi"
+Write-Host "Installed DualSenseRDR2.asi and DualSenseRDR2\DualSenseCore.dll"
 
 # 3. the "DualSense" page in the game's Settings (needs Lenny's Mod Loader: <game>\lml)
 $lmlSrc = Join-Path $here "lml\DualSenseRDR2"
